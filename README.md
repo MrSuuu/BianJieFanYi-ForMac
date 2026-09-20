@@ -1,4 +1,4 @@
-# 译 · macOS 菜单栏翻译工具
+# 便捷翻译 · macOS 菜单栏翻译工具
 
 一个自己用的 macOS 翻译小工具：**常驻菜单栏，选中文字就地翻译**，不打断你手上的事。
 
@@ -18,11 +18,11 @@
 ### 方式一：直接下打包好的（推荐）
 
 到 **[Releases 页面](https://github.com/MrSuuu/Yi-macOS/releases/latest)** 下载最新版
-**`Yi-macOS-3.1.zip`**（仓库里的 [`dist/`](dist) 目录也放了一份同样的），解压后：
+**`BianJieFanYi-macOS-3.2.zip`**（仓库里的 [`dist/`](dist) 目录也放了一份同样的），解压后：
 
 * **双击「安装.command」** —— 自动装到「应用程序」并解除系统拦截（需要输一次密码）
-* 或者手动：把 `译.app` 拖进「应用程序」，然后在终端跑一次
-  `xattr -dr com.apple.quarantine /Applications/译.app`
+* 或者手动：把 `便捷翻译.app` 拖进「应用程序」，然后在终端跑一次
+  `xattr -dr com.apple.quarantine /Applications/便捷翻译.app`
 
 > **为什么需要这一步？** 这个 app 没有苹果开发者签名（个人开发者签名要 99 美元/年），
 > 从网上下载的文件会被 macOS 打上 `com.apple.quarantine` 隔离标记并被 Gatekeeper 拦下。
@@ -37,8 +37,8 @@
 ```bash
 git clone https://github.com/MrSuuu/Yi-macOS.git
 cd Yi-macOS
-bash build.sh                 # 编出来 译.app（只编本机架构，最快）
-open 译.app
+bash build.sh                 # 编出来 便捷翻译.app（只编本机架构，最快）
+open 便捷翻译.app
 ```
 
 ---
@@ -65,8 +65,8 @@ open 译.app
 「选区浮窗」需要 **辅助功能（Accessibility）权限** —— 系统规定：任何程序想读取
 其他程序的选中文字，都必须由用户在系统设置里显式授权。
 
-1. 菜单栏「译」→ 设置 → 打开「**开启选区浮窗**」（会自动弹出授权请求）
-2. 到 **系统设置 → 隐私与安全性 → 辅助功能**，给「译」打勾
+1. 菜单栏「便捷翻译」→ 设置 → 打开「**开启选区浮窗**」（会自动弹出授权请求）
+2. 到 **系统设置 → 隐私与安全性 → 辅助功能**，给「便捷翻译」打勾
 3. 之后在任意软件里选中文字，旁边就会浮出翻译面板
 
 权限只用于读取选中文字、以及在浮窗上定位。**代码全部开源在这，可以自己审。**
@@ -76,9 +76,11 @@ open 译.app
 ## 目录结构
 
 ```
-Sources/main.swift      全部源码（单文件，约 2200 行）
+Sources/main.swift      全部源码（单文件，约 2300 行）
 build.sh                本地开发构建（本机架构 + 自签证书签名）
 package.sh              发布打包（universal 双架构 + ad-hoc 签名 + zip）
+sync.sh                 一键同步到 GitHub（类型检查闸门 → commit → push）
+.github/workflows/      打 tag 自动发 Release
 AppIcon.icns            图标
 Tools/                  生成图标的脚本（iconset + makeicon.swift）
 dist/                   发布包
@@ -107,15 +109,15 @@ macOS 对 **ad-hoc 签名**的 app，把「辅助功能」授权**绑死在二�
 ## 常见问题
 
 **打开后什么都没有？**
-它是菜单栏常驻程序 —— 没有 Dock 图标也没有窗口。看**屏幕右上角菜单栏**找「译」图标，
+它是菜单栏常驻程序 —— 没有 Dock 图标也没有窗口。看**屏幕右上角菜单栏**找「便捷翻译」图标，
 或者按 `⌥Space` 直接呼出窗口。
 
 **提示「已损坏」或「无法打开」？**
-是 Gatekeeper 拦截，执行 `xattr -dr com.apple.quarantine /Applications/译.app` 即可。
+是 Gatekeeper 拦截，执行 `xattr -dr com.apple.quarantine /Applications/便捷翻译.app` 即可。
 
 **开了浮窗但选中文字没反应？**
 99% 是辅助功能权限没生效。先在设置里把开关关掉再打开（会重新弹授权框），
-确认系统设置里「译」是勾上的；换过 app 版本（重新编译/下载新版）之后，**需要重新授权一次**。
+确认系统设置里「便捷翻译」是勾上的；换过 app 版本（重新编译/下载新版）之后，**需要重新授权一次**。
 另外 Discord / Chrome 这类 Chromium 内核的应用默认不构建无障碍树，
 代码里已针对它们做了处理，但要先有权限。
 

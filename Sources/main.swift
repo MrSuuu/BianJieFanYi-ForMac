@@ -504,7 +504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return AppDelegate.handlePastedImage?(image) == true ? nil : event
         }
 
-        // 2) 系统「服务」菜单：选中文字 → 右键 → 用「译」翻译
+        // 2) 系统「服务」菜单：选中文字 → 右键 → 用「便捷翻译」翻译
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
 
@@ -2047,17 +2047,59 @@ struct YiApp: App {
     @AppStorage("showMenuBar") private var showMenuBar = true
 
     var body: some Scene {
-        WindowGroup("译") { ContentView() }
+        WindowGroup("便捷翻译") { ContentView() }
             .defaultSize(width: 580, height: 440)
 
         Window("设置", id: settingsWindowID) { EngineSettingsView() }
             .windowResizability(.contentSize)
 
-        MenuBarExtra("译", systemImage: "character.book.closed", isInserted: $showMenuBar) {
+        MenuBarExtra(isInserted: $showMenuBar) {
             MenuBarMenu()
+        } label: {
+            Image(nsImage: StatusBarIcon.image)
+                .accessibilityLabel("便捷翻译")
         }
         .menuBarExtraStyle(.menu)
     }
+}
+
+// MARK: - 状态栏图标
+
+/// 状态栏图标：实心圆角方块 + 镂空的「译」字（底色实心、字是透明的）。
+///
+/// 画成 **template 图**（`isTemplate = true`）是刻意的，不是偷懒：
+/// 模板图的不透明部分会被 macOS 用「当前菜单栏前景色」填充，于是
+///   · 深色菜单栏 → 白底 + 镂空字（正是要的效果）
+///   · 浅色菜单栏 → 深底 + 镂空字（自动反色，否则白底和白菜单栏糊在一起，图标等于消失）
+/// 这样两种外观下都看得见。若要做成"永远纯白底"，把 `isTemplate` 改成 false、
+/// 并把下面 setFill 改成 NSColor.white 即可 —— 但浅色菜单栏下会基本看不见。
+enum StatusBarIcon {
+    static let image: NSImage = {
+        // 18×18 是菜单栏图标的常见尺寸；方块留 1pt 边距，避免贴满显得臃肿
+        let side: CGFloat = 18
+        let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            let box = rect.insetBy(dx: 1, dy: 1.5)
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: box, xRadius: 4.5, yRadius: 4.5).fill()
+
+            // 关键一步：用 destinationOut 把「译」字"挖"掉 → 字的位置变成透明（镂空）
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return true }
+            ctx.saveGState()
+            ctx.setBlendMode(.destinationOut)
+            let text = "译" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: box.height * 0.80, weight: .bold),
+                .foregroundColor: NSColor.black,
+            ]
+            let ts = text.size(withAttributes: attrs)
+            text.draw(at: NSPoint(x: box.midX - ts.width / 2, y: box.midY - ts.height / 2 + 0.5),
+                      withAttributes: attrs)
+            ctx.restoreGState()
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }()
 }
 
 // MARK: - 菜单栏下拉
@@ -2067,7 +2109,7 @@ struct MenuBarMenu: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Button("显示「译」窗口　⌥Space") { HotKeyManager.shared.onFire?() }
+        Button("显示「便捷翻译」窗口　⌥Space") { HotKeyManager.shared.onFire?() }
         Button("朗读剪贴板内容") {
             if let text = NSPasteboard.general.string(forType: .string) { Speaker.shared.speak(text) }
         }
@@ -2157,13 +2199,13 @@ struct EngineSettingsView: View {
                     Button("打开「辅助功能」权限设置") {
                         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                     }
-                    Text("首次使用需在 系统设置 → 隐私与安全性 → 辅助功能 里给「译」打勾，否则监测不到其他 App 的选区。开启开关时已自动弹出授权请求。")
+                    Text("首次使用需在 系统设置 → 隐私与安全性 → 辅助功能 里给「便捷翻译」打勾，否则监测不到其他 App 的选区。开启开关时已自动弹出授权请求。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Text("""
                 开启后：在 GitHub、Discord、浏览器、邮件等任意软件里选中一段文字，
                 屏幕对应位置会浮出一个小面板，自动翻译出译文——
-                当前软件保持前台，不需要切到「译」窗口。
+                当前软件保持前台，不需要切到「便捷翻译」窗口。
                 """)
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             }
@@ -2191,7 +2233,7 @@ struct EngineSettingsView: View {
                 }
                 .pickerStyle(.menu)
                 .onChange(of: accentTheme) { _, _ in EdgeDockController.shared.refreshAppearance() }
-                Toggle("在菜单栏显示「译」图标", isOn: $showMenuBar)
+                Toggle("在菜单栏显示「便捷翻译」图标", isOn: $showMenuBar)
                 Toggle("点窗口红 X 收成胶囊", isOn: $edgeDock)
                     .onChange(of: edgeDock) { _, on in EdgeDockController.shared.applySetting(enabled: on) }
                 Toggle("开机启动", isOn: $startAtLogin)
@@ -2209,7 +2251,7 @@ struct EngineSettingsView: View {
                 Text("""
                 App 当前是「菜单栏常驻」模式（LSUIElement）：不显示 Dock 图标，也没有自己的菜单栏。
                 所以设置入口放在菜单栏下拉里，全局呼出固定为 ⌥Space。
-                如果关掉开机启动，下次要靠 Spotlight（⌘Space 搜「译」）或手动打开来启动它。
+                如果关掉开机启动，下次要靠 Spotlight（⌘Space 搜「便捷翻译」）或手动打开来启动它。
                 """)
                 .font(.system(size: 11)).foregroundStyle(.secondary)
                 Text("窗口置顶在状态栏那个「置顶」勾选框里。")

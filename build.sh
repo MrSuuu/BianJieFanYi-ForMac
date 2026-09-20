@@ -11,12 +11,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-APP_NAME="译"
+APP_NAME="便捷翻译"
 APP_DIR="$APP_NAME.app"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 SRC="Sources/main.swift"
-APP_VERSION="3.1"        # 发布用版本号（改了记得同步 README 和 package.sh）
-APP_BUILD="31"
+APP_VERSION="3.2"        # 发布用版本号（改了记得同步 README 和 package.sh）
+APP_BUILD="32"
 
 # ARCHS：要编的架构，空格分隔。默认只编本机（Intel）用的 x86_64，构建最快；
 #        发布给别人时用 `ARCHS="x86_64 arm64" bash build.sh` 编 universal，
@@ -84,13 +84,13 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>译</string>
+    <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>
-    <string>译</string>
+    <string>$APP_NAME</string>
     <key>CFBundleIdentifier</key>
     <string>com.zegeyoudaoli.translator</string>
     <key>CFBundleExecutable</key>
-    <string>译</string>
+    <string>$APP_NAME</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -123,11 +123,11 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <array>
         <dict>
             <key>NSMenuItem</key>
-            <dict><key>default</key><string>用「译」翻译</string></dict>
+            <dict><key>default</key><string>用「便捷翻译」翻译</string></dict>
             <key>NSMessage</key>
             <string>translateText</string>
             <key>NSPortName</key>
-            <string>译</string>
+            <string>$APP_NAME</string>
             <key>NSSendTypes</key>
             <array><string>NSStringPboardType</string></array>
         </dict>

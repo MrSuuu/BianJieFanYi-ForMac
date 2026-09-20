@@ -2,7 +2,7 @@
 # package.sh —— 打发布包（给别人下载用）
 #
 # 用法: bash package.sh
-# 产物: dist/译-macOS-<版本>.zip   （里面是 译.app + 安装说明）
+# 产物: dist/BianJieFanYi-macOS-<版本>.zip（里面是 便捷翻译.app + 安装.command + 使用说明）
 #
 # 与 build.sh 的区别（两个是不同用途，别混）：
 #   build.sh   → 本地开发用：只编本机架构、用自签证书签名（TCC 授权能跨重建存活）
@@ -17,10 +17,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="译"
+# 应用名/版本号都从 build.sh 里取，避免两处写死对不上
+APP_NAME="$(grep -m1 '^APP_NAME=' build.sh | cut -d'"' -f2)"
 VERSION="$(grep -m1 '^APP_VERSION=' build.sh | cut -d'"' -f2)"
 DIST="dist"
-ZIP="$DIST/Yi-macOS-$VERSION.zip"   # 用 ASCII 文件名：中文名在分享链接里会被百分号编码成一长串
+# 发布包用 ASCII 文件名：中文名贴到聊天/终端里会变成一长串百分号编码
+ZIP="$DIST/BianJieFanYi-macOS-$VERSION.zip"
 
 echo "═══════════════════════════════════════"
 echo " 打发布包 $APP_NAME $VERSION"
@@ -40,34 +42,38 @@ rm -rf "$DIST"
 mkdir -p "$DIST/$APP_NAME"
 cp -R "$APP_NAME.app" "$DIST/$APP_NAME/"
 
-# 一键安装脚本：双击就能装到「应用程序」并自动解除 Gatekeeper 隔离
+# 一键安装脚本：双击就能装到「应用程序」并自动解除 Gatekeeper 隔离。
+# 注意这里用带引号的 heredoc（'SH'）：里面的 $APP / $0 必须留到**对方机器上**再展开；
+# 若让生成时就展开，`cd "$(dirname "$0")"` 会被替换成本脚本的目录（错得离谱）。
+# 所以应用名不写死，改成在对方机器上用通配符找 .app。
 cat > "$DIST/$APP_NAME/安装.command" <<'SH'
 #!/bin/bash
-# 「译」一键安装：拷到「应用程序」并解除 Gatekeeper 隔离
+# 一键安装：拷到「应用程序」并解除 Gatekeeper 隔离
 set -e
 cd "$(dirname "$0")"
-APP="译.app"
-echo "正在安装「译」…"
-if [ ! -d "$APP" ]; then echo "✗ 没找到 $APP，请确保它和本脚本在同一目录"; read -r -p "回车退出"; exit 1; fi
-# 复制（要写 /Applications，可能需要管理员密码）
+APP="$(ls -d *.app 2>/dev/null | head -1)"
+[ -n "$APP" ] || { echo "✗ 当前目录里没找到 .app，请确保它和本脚本在同一层"; read -r -p "回车退出"; exit 1; }
+NAME="$(basename "$APP")"
+echo "正在安装「$NAME」…"
 if [ -w /Applications ]; then
-    rm -rf "/Applications/$APP"; cp -R "$APP" "/Applications/$APP"
+    rm -rf "/Applications/$NAME"; cp -R "$APP" "/Applications/$NAME"
 else
     echo "需要管理员权限写入「应用程序」目录，请输入密码："
-    sudo rm -rf "/Applications/$APP"; sudo cp -R "$APP" "/Applications/$APP"
+    sudo rm -rf "/Applications/$NAME"; sudo cp -R "$APP" "/Applications/$NAME"
 fi
-# 解除隔离标记：从网上下载的 app 会被打上 com.apple.quarantine，不去掉会被 Gatekeeper 拦
-xattr -dr com.apple.quarantine "/Applications/$APP" 2>/dev/null || true
-open "/Applications/$APP"
+# 解除隔离标记：从网上下载的文件会被打上 com.apple.quarantine，不去掉会被 Gatekeeper 拦
+xattr -dr com.apple.quarantine "/Applications/$NAME" 2>/dev/null || true
+open "/Applications/$NAME"
 echo
-echo "✓ 装好了，已经启动。菜单栏会有「译」的图标，点它就能用。"
-echo "  首次用「选区浮窗」需要去 系统设置 → 隐私与安全性 → 辅助功能 给「译」打勾。"
+echo "✓ 装好了，已经启动。菜单栏会有图标，点它就能用。"
+echo "  首次用「选区浮窗」需要去 系统设置 → 隐私与安全性 → 辅助功能 给「$NAME」打勾。"
 read -r -p "回车关闭本窗口"
 SH
 chmod +x "$DIST/$APP_NAME/安装.command"
 
-cat > "$DIST/$APP_NAME/使用说明.txt" <<'TXT'
-「译」—— macOS 菜单栏翻译工具
+# 说明文件里没有 $ 和反引号，所以用不带引号的 heredoc，好把应用名插进去
+cat > "$DIST/$APP_NAME/使用说明.txt" <<TXT
+${APP_NAME} —— macOS 菜单栏翻译工具
 ================================
 
 安装
@@ -76,9 +82,9 @@ cat > "$DIST/$APP_NAME/使用说明.txt" <<'TXT'
 并自动去掉 Gatekeeper 隔离标记）。
 
 如果不想跑脚本，手动装也行：
-  1. 把「译.app」拖进「应用程序」
+  1. 把「${APP_NAME}.app」拖进「应用程序」
   2. 打开「终端」执行一次（去掉隔离标记，否则会被系统拦住）：
-       xattr -dr com.apple.quarantine /Applications/译.app
+       xattr -dr com.apple.quarantine "/Applications/${APP_NAME}.app"
   3. 双击打开
 
 系统要求
@@ -88,10 +94,10 @@ Intel 与 Apple Silicon 都可以（universal 二进制）。
 
 首次使用
 --------
-1. 打开后没有 Dock 图标也没有窗口 —— 它在菜单栏。看屏幕右上角找「译」图标。
+1. 打开后没有 Dock 图标也没有窗口 —— 它在菜单栏。看屏幕右上角找图标。
 2. 全局呼出窗口：⌥Space
-3. 划词翻译（可选，推荐）：菜单栏「译」→ 设置 → 打开「开启选区浮窗」，
-   按提示到 系统设置 → 隐私与安全性 → 辅助功能 给「译」打勾。
+3. 划词翻译（可选，推荐）：菜单栏图标 → 设置 → 打开「开启选区浮窗」，
+   按提示到 系统设置 → 隐私与安全性 → 辅助功能 给「${APP_NAME}」打勾。
    之后在任意软件里选中文字，就会在旁边浮出翻译面板。
 TXT
 
