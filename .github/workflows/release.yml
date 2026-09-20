@@ -1,0 +1,63 @@
+name: Release
+
+# 打 tag 就自动发 Release，并把对应版本的发布包挂上去。
+# 为什么用 Actions 的 GITHUB_TOKEN 而不是本机操作：
+#   本机没有 gh CLI、也没有 Personal Access Token，GitHub 的建仓/发 Release 接口
+#   都必须带 token；而 Actions 运行时 GitHub 会自动注入 secrets.GITHUB_TOKEN，
+#   所以"发 Release"这件事交给 CI 做，本机只需要 git push（SSH key 就够）。
+#
+# 发布新版本的完整流程：
+#   1. 本地改代码 → APP_VERSION 加一
+#   2. bash package.sh                    # 打出 dist/Yi-macOS-<版本>.zip
+#   3. git add -A && git commit && git push
+#   4. git tag v<版本> && git push origin v<版本>   # ← 这一步触发本工作流
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:        # 也允许在 Actions 页面手动跑一次
+
+permissions:
+  contents: write           # 发 Release 需要写权限
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验发布包存在
+        run: |
+          # tag 名 v3.1 → 版本号 3.1 → 找 dist/Yi-macOS-3.1.zip
+          VER="${GITHUB_REF_NAME#v}"
+          ZIP="dist/Yi-macOS-${VER}.zip"
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::找不到 $ZIP —— 请先在本地跑 'bash package.sh' 并把产物提交上来"
+            echo "当前 dist/ 内容："; ls -l dist/ || true
+            exit 1
+          fi
+          echo "找到发布包：$ZIP ($(du -h "$ZIP" | cut -f1))"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      - name: 发 Release（用 runner 自带的 gh CLI + 自动注入的 token）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOTES=$(cat <<'TXT'
+          ## 安装
+
+          1. 下载下面的 **Yi-macOS-*.zip**
+          2. 解压，双击 **「安装.command」**（会装到「应用程序」并自动解除 Gatekeeper 隔离）
+          3. 打开后在**菜单栏右上角**找「译」图标，或按 `⌥Space` 呼出
+
+          > 首次使用「选区浮窗」需要到 **系统设置 → 隐私与安全性 → 辅助功能** 给「译」打勾。
+
+          详细说明见 [README](https://github.com/MrSuuu/Yi-macOS#readme)。
+          TXT
+          )
+          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+            --title "译 $GITHUB_REF_NAME" \
+            --notes "$NOTES" \
+            --generate-notes
