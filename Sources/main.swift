@@ -2610,6 +2610,7 @@ struct EngineSettingsView: View {
     @AppStorage("popupClearness") private var popupClearness = 0.5        // 选区浮窗
     @AppStorage("mainClearness") private var mainClearness = 0.30         // 翻译窗口
     @AppStorage("settingsClearness") private var settingsClearness = 0.30 // 设置窗口（就是本窗口）
+    @State private var initialFocusCleared = false   // 见文末 onReceive 的说明
     @AppStorage("capsuleClearness") private var capsuleClearness = 0.0    // 菜单栏胶囊
     @AppStorage("appearanceMode") private var appearanceMode = "system"   // 跟随系统 / 浅色 / 深色
     @State private var loginItemError: String?
@@ -2752,5 +2753,22 @@ struct EngineSettingsView: View {
             w.backgroundColor = .clear
             w.titlebarAppearsTransparent = true
         })
+        // 修「每次打开设置，APP ID 就被整段选中」：
+        // 原因是 SwiftUI 在 macOS 上打开窗口时会把焦点**自动给第一个可聚焦控件**
+        // （本页就是「APP ID」输入框），而 NSTextField 一成为 first responder 就会
+        // **selectAll** 已有内容 —— 于是每次进来都看到它是蓝底选中态。
+        // 处理：窗口成为 key window 后，把初始焦点清掉（等于不聚焦任何控件）。
+        // 之后用户点哪个输入框才聚焦哪个，而**鼠标点击不会触发全选**（只有 Tab/程序化
+        // 聚焦才会），所以体验正常了。
+        // 只在"本次打开窗口"里清一次：切走再切回设置不打扰（那时也不存在全选问题）。
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            guard !initialFocusCleared,
+                  let w = note.object as? NSWindow, w.title == "设置" else { return }
+            initialFocusCleared = true
+            // 延后一点：SwiftUI 给初始焦点是在窗口布局完成之后
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                w.makeFirstResponder(nil)
+            }
+        }
     }
 }
