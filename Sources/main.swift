@@ -2087,8 +2087,10 @@ enum StatusBarIcon {
             ctx.saveGState()
             ctx.setBlendMode(.destinationOut)
             let text = "译" as NSString
+            // 0.72 是试出来的：再大（0.80）字会顶满方块、四周留白太窄，
+            // 镂空效果会变成"一圈细边描着的字"；再小则笔画糊。0.72 四周留白与字重最平衡。
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: box.height * 0.80, weight: .bold),
+                .font: NSFont.systemFont(ofSize: box.height * 0.72, weight: .bold),
                 .foregroundColor: NSColor.black,
             ]
             let ts = text.size(withAttributes: attrs)
