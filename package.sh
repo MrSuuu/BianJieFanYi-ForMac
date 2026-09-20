@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 APP_NAME="译"
 VERSION="$(grep -m1 '^APP_VERSION=' build.sh | cut -d'"' -f2)"
 DIST="dist"
-ZIP="$DIST/$APP_NAME-macOS-$VERSION.zip"
+ZIP="$DIST/Yi-macOS-$VERSION.zip"   # 用 ASCII 文件名：中文名在分享链接里会被百分号编码成一长串
 
 echo "═══════════════════════════════════════"
 echo " 打发布包 $APP_NAME $VERSION"

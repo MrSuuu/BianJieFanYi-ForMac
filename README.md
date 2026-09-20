@@ -17,7 +17,7 @@
 
 ### 方式一：直接下打包好的（推荐）
 
-到本仓库的 [`dist/`](dist) 目录下载 **`译-macOS-3.1.zip`**，解压后：
+到本仓库的 [`dist/`](dist) 目录下载 **`Yi-macOS-3.1.zip`**，解压后：
 
 * **双击「安装.command」** —— 自动装到「应用程序」并解除系统拦截（需要输一次密码）
 * 或者手动：把 `译.app` 拖进「应用程序」，然后在终端跑一次
@@ -34,7 +34,7 @@
 只有一份 Swift 源码，不需要 Xcode 工程文件，装好 Xcode 命令行工具即可：
 
 ```bash
-git clone git@github.com:MrSuuu/Yi-macOS.git
+git clone https://github.com/MrSuuu/Yi-macOS.git
 cd Yi-macOS
 bash build.sh                 # 编出来 译.app（只编本机架构，最快）
 open 译.app
