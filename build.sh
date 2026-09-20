@@ -15,8 +15,8 @@ APP_NAME="便捷翻译"
 APP_DIR="$APP_NAME.app"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 SRC="Sources/main.swift"
-APP_VERSION="3.2"        # 发布用版本号（改了记得同步 README 和 package.sh）
-APP_BUILD="32"
+APP_VERSION="3.3"        # 发布用版本号（改了记得同步 README 和 package.sh）
+APP_BUILD="33"
 
 # ARCHS：要编的架构，空格分隔。默认只编本机（Intel）用的 x86_64，构建最快；
 #        发布给别人时用 `ARCHS="x86_64 arm64" bash build.sh` 编 universal，

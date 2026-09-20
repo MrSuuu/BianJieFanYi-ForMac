@@ -18,7 +18,7 @@
 ### 方式一：直接下打包好的（推荐）
 
 到 **[Releases 页面](https://github.com/MrSuuu/Yi-macOS/releases/latest)** 下载最新版
-**`BianJieFanYi-macOS-3.2.zip`**（仓库里的 [`dist/`](dist) 目录也放了一份同样的），解压后：
+**`BianJieFanYi-macOS-3.3.zip`**（仓库里的 [`dist/`](dist) 目录也放了一份同样的），解压后：
 
 * **双击「安装.command」** —— 自动装到「应用程序」并解除系统拦截（需要输一次密码）
 * 或者手动：把 `便捷翻译.app` 拖进「应用程序」，然后在终端跑一次
