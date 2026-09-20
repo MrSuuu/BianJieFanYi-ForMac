@@ -43,23 +43,28 @@ jobs:
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
           echo "VER=$VER" >> "$GITHUB_ENV"
 
-      - name: 发 Release（用 runner 自带的 gh CLI + 自动注入的 token）
+      - name: 发 Release（幂等：已存在就更新，不报错）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NOTES=$(cat <<'TXT'
           ## 安装
 
-          1. 下载下面的 **Yi-macOS-*.zip**
+          1. 下载下面的 **BianJieFanYi-*.zip**
           2. 解压，双击 **「安装.command」**（会装到「应用程序」并自动解除 Gatekeeper 隔离）
-          3. 打开后在**菜单栏右上角**找「译」图标，或按 `⌥Space` 呼出
+          3. 打开后在**菜单栏右上角**找那个「译」字方块图标，或按 `⌥Space` 呼出
 
-          > 首次使用「选区浮窗」需要到 **系统设置 → 隐私与安全性 → 辅助功能** 给「译」打勾。
+          > 首次使用「选区浮窗」需要到 **系统设置 → 隐私与安全性 → 辅助功能** 给「便捷翻译」打勾。
 
           详细说明见 [README](https://github.com/MrSuuu/Yi-macOS#readme)。
           TXT
           )
-          gh release create "$GITHUB_REF_NAME" "$ZIP" \
-            --title "译 $GITHUB_REF_NAME" \
-            --notes "$NOTES" \
-            --generate-notes
+          TITLE="便捷翻译 $GITHUB_REF_NAME"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # 已存在（比如改了文案后重推 tag 刷新）→ 更新标题/说明，并覆盖附件
+            gh release edit "$GITHUB_REF_NAME" --title "$TITLE" --notes "$NOTES"
+            gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$ZIP" \
+              --title "$TITLE" --notes "$NOTES" --generate-notes
+          fi
