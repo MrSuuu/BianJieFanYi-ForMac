@@ -55,12 +55,16 @@ git push -q origin main
 echo "✓ 已同步 $(git log --oneline -1)"
 echo "  https://github.com/MrSuuu/Yi-macOS"
 
-# 提醒：改了源码但没动版本号 → repo 里的 dist 发布包已经落后了
-if git show --name-only --pretty=format: HEAD | grep -q "Sources/main.swift"; then
-    if ! git show --name-only --pretty=format: HEAD | grep -q "build.sh"; then
-        echo
-        echo "提示：这次改了源码但没升版本号。"
-        echo "      dist/ 里的发布包还是旧版（别人下载会拿到旧行为）。"
-        echo "      要让发布包跟上：改 build.sh 的 APP_VERSION → bash package.sh → 再 sync 一次 → tag"
-    fi
+# 提醒：改了源码，但发布包没跟着更新 → repo 里的 dist 已经落后于源码
+# 判断条件要同时看三件事，否则会误报：
+#   · 动了 Sources/main.swift（功能变了）
+#   · 本次提交里 dist/*.zip 没变（没重新打包）
+#   · build.sh 也没变（连版本号都没升）
+CHANGED="$(git show --name-only --pretty=format: HEAD)"
+if echo "$CHANGED" | grep -q "Sources/main.swift" \
+   && ! echo "$CHANGED" | grep -q "^dist/.*\.zip$" \
+   && ! echo "$CHANGED" | grep -q "^build.sh$"; then
+    echo
+    echo "提示：这次改了源码，但发布包没一起更新（dist/ 里还是旧行为）。"
+    echo "      要让别人下到新版：改 build.sh 的 APP_VERSION → bash package.sh → 再跑一次 sync.sh → 打 tag"
 fi
