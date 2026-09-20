@@ -17,7 +17,7 @@
 
 ### 方式一：直接下打包好的（推荐）
 
-到 **[Releases 页面](https://github.com/MrSuuu/BianJieFanYiForMac/releases/latest)** 下载最新版
+到 **[Releases 页面](https://github.com/MrSuuu/BianJieFanYi-ForMac/releases/latest)** 下载最新版
 **`BianJieFanYi-macOS-3.3.zip`**（仓库里的 [`dist/`](dist) 目录也放了一份同样的），解压后：
 
 * **双击「安装.command」** —— 自动装到「应用程序」并解除系统拦截（需要输一次密码）
@@ -35,8 +35,8 @@
 只有一份 Swift 源码，不需要 Xcode 工程文件，装好 Xcode 命令行工具即可：
 
 ```bash
-git clone https://github.com/MrSuuu/BianJieFanYiForMac.git
-cd BianJieFanYiForMac
+git clone https://github.com/MrSuuu/BianJieFanYi-ForMac.git
+cd BianJieFanYi-ForMac
 bash build.sh                 # 编出来 便捷翻译.app（只编本机架构，最快）
 open 便捷翻译.app
 ```
