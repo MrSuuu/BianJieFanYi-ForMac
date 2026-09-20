@@ -786,6 +786,8 @@ final class SelectionPopupController {
     private var pendingSince = Date.distantPast
     private var suppressText = ""                   // 被用户手动关掉的选区内容（不再弹）
     private var suppressBundle = ""                 // ↑ 这段文字是在哪个 App 里被关掉的
+    private var popupBundle = ""                    // 浮窗当前展示的这段文字属于哪个 App（抑制归属只能用它）
+    private var lastAppSwitch = Date.distantPast    // 最近一次"前台 App 发生变化"的时刻
     private var lastFrontBundle = ""                // 用于判断"换了 App"
     private let settleDelay: TimeInterval = 0.30    // 选区内容静止多久才算"选完了"
     private let panelW: CGFloat = 320, panelH: CGFloat = 230
@@ -852,6 +854,7 @@ final class SelectionPopupController {
         let bid = front.bundleIdentifier ?? "?"
         if bid != lastFrontBundle {
             lastFrontBundle = bid
+            lastAppSwitch = Date()
             // 切到别的 App → 收窗（并抑制这段文字）。不收的话切回来它会自己弹，
             // 或者在新 App 里挂着一个属于旧 App 的浮窗。
             if panel?.isVisible == true { hideNaturally(reason: "切到了别的 App") }
@@ -920,8 +923,14 @@ final class SelectionPopupController {
         // 用户"重新选了一次"（拖动/双击）→ 解除抑制。
         // 这条是泽哥要的："点掉之后我再手动重选同一段，应该还能弹"。
         // 关键在"拖动/双击"才算重新选，单击（比如切窗口点一下）不算。
-        if !suppressText.isEmpty, !suppressBundle.isEmpty,
-           lastSelectGesture > suppressAt.addingTimeInterval(0.5) {
+        // 解除抑制（"用户在**这儿**重新选了一遍同一段文字"）要同时满足三点：
+        //   ① 是同一个 App —— 在别的 App 里选字不该清掉这条记录；
+        //   ② 选字动作晚于抑制生效 —— 否则切走时的旧动作会立刻把抑制解掉；
+        //   ③ 选字动作晚于**最近一次切 App** —— 这条是关键：用户在 B 里选过字，
+        //      再切回 A（A 的旧选区还在），②会成立，只有③能挡住它。
+        if !suppressText.isEmpty, bid == suppressBundle,
+           lastSelectActivity > suppressAt.addingTimeInterval(0.5),
+           lastSelectActivity > lastAppSwitch {
             suppressText = ""; suppressBundle = ""
         }
         // 用户手动关掉过这段 → 不再弹（哪怕它还选着）。
@@ -936,8 +945,16 @@ final class SelectionPopupController {
         //    网页加载完自己设个选区……这些都算"没人要求翻译"。
         //    ⚠️ 这个判断只在"要不要弹"这一步生效；已经弹出来的浮窗不受它影响
         //    （以前这里会 maybeHide()，于是 1.6 秒手势窗一过，浮窗就被自己收掉了）。
-        if !userGestureRecently {
-            debugLog("noGesture", "跳过弹出（非用户主动操作）")
+        let mouseSel = mouseSelectedRecently
+        let keySel = keySelectedRecently
+        if !mouseSel, !keySel {
+            debugLog("noGesture", "跳过（没有选字动作：单击或系统自动选中）")
+            return
+        }
+        // 键盘路径再加一道长度门槛：Shift+方向键很容易意外停在一两个字符上，
+        // 而"翻译单个字符"几乎不是用户意图；鼠标拖动/双击是明确动作，任何长度都放行。
+        if !mouseSel, trimmed.count < 2 {
+            debugLog("skipTiny", "跳过（键盘只选中 \(trimmed.count) 个字符）")
             return
         }
 
@@ -1005,7 +1022,7 @@ final class SelectionPopupController {
         // 只统计"用户刚做了选字动作（拖动/双击）之后"的失败，
         // 否则"压根没选东西"也会被算成失败，白白导出报告（上一版就被 WorkBuddy 覆盖了 Safari 的）
         missStreak += 1
-        let selectGestureFresh = Date().timeIntervalSince(lastSelectGesture) < 2.5
+        let selectGestureFresh = Date().timeIntervalSince(lastSelectActivity) < 2.5
         if missStreak >= 6, selectGestureFresh,
            Date().timeIntervalSince(probeAt[bundleID] ?? .distantPast) > 30 {
             probeAt[bundleID] = Date()
@@ -1187,7 +1204,7 @@ final class SelectionPopupController {
         let now = Date()
         // 没人操作的时候扫树纯属浪费对方 App 的 CPU 和 IPC —— 这一步很贵，
         // 而且会把我们自己的主线程占住（AX 调用是同步的），表现出来就是"浮窗时灵时不灵"。
-        guard now.timeIntervalSince(lastGesture) < descentGestureWindow else { return nil }
+        guard now.timeIntervalSince(lastSelectActivity) < descentGestureWindow else { return nil }
         guard now.timeIntervalSince(lastDescent) >= descentInterval else { return nil }
         lastDescent = now
 
@@ -1212,20 +1229,30 @@ final class SelectionPopupController {
 
     // MARK: 用户主动操作检测
 
-    private var lastGesture = Date.distantPast
-    private var lastSelectGesture = Date.distantPast   // 明确的"选字动作"：拖动 或 双击
-    private var mouseDownAt = Date.distantPast
+    private var lastDragSelect = Date.distantPast   // 鼠标选字：拖动 或 双击
+    private var lastKeySelect = Date.distantPast    // 键盘选字：Shift/⌘/⌥ 按下或松开
     private var mouseDownPoint = NSPoint.zero
     private var lastClickUp = Date.distantPast
     private var modifierHeld = false
-    private let gestureWindow: TimeInterval = 1.6
+    private let selectWindow: TimeInterval = 2.0    // "刚做过选字动作"的有效期
     private var gestureMonitors: [Any] = []
+    private var escapeMonitor: Any?                 // 浮窗可见期间的 Esc 监听（不可见时不挂）
 
-    /// "最近有用户主动操作"：鼠标按/松过，或者刚按过/正按着 Shift/⌘/⌥。
-    /// 后者是为了键盘选区（Shift+方向键、⌘A）：按住期间算，**松开那一刻也算一次**，
-    /// 否则松开 Shift 后闸门立刻关上，键盘选中的文字反而弹不出来。
-    private var userGestureRecently: Bool {
-        modifierHeld || Date().timeIntervalSince(lastGesture) < gestureWindow
+    /// 最近一次"像样的选字动作"（鼠标拖动/双击，或键盘修饰键操作）
+    private var lastSelectActivity: Date { max(lastDragSelect, lastKeySelect) }
+
+    /// 闸门·鼠标路径：拖动（位移 >4px）或双击 —— 用户明确圈了一段文字。
+    /// 单击**不算**：QQ 点开一个会话时，它会把内部 UI 状态报成 1 个字符的
+    /// "选区"，而旧判定只看"1.6 秒内按过鼠标"，单击就满足了 → 弹出一个空浮窗。
+    private var mouseSelectedRecently: Bool {
+        Date().timeIntervalSince(lastDragSelect) < selectWindow
+            && lastDragSelect > lastAppSwitch
+    }
+    /// 闸门·键盘路径：Shift 按住或刚松开 —— 键盘选字（Shift+方向键、Shift+点击）。
+    /// 松开那一刻也要算，否则一松手闸门就关，键盘选中的字反而弹不出来。
+    private var keySelectedRecently: Bool {
+        (modifierHeld || Date().timeIntervalSince(lastKeySelect) < selectWindow)
+            && lastKeySelect > lastAppSwitch
     }
 
     /// 只监听"有没有操作"，不记录任何内容：
@@ -1241,13 +1268,19 @@ final class SelectionPopupController {
             guard let self else { return }
             if event.type == .flagsChanged {
                 let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                let held = !mods.intersection([.shift, .command, .option, .control]).isEmpty
-                self.modifierHeld = held
-                self.lastGesture = Date()      // 按下和松开都算一次操作
+                // ⚠️ **只认 Shift**，绝不能把 ⌘ 算进来。
+                //    原因：⌘ 是最常用的快捷键修饰键（⌘Tab 切 App、⌘C、⌘S…），
+                //    一旦把它当成"键盘选字"，那么"用 ⌘Tab 切回原 App"这个动作本身
+                //    就会刷新选字时间戳 → 解除抑制 → 那张旧选区又弹出来。
+                //    Shift 才是真正的扩选键（Shift+方向键、Shift+点击）。
+                let wasHeld = self.modifierHeld
+                let shiftHeld = mods.contains(.shift)
+                self.modifierHeld = shiftHeld
+                // 按下与**松开**都算一次：松开若不算，松手那一刻闸门就关上，
+                // 键盘刚选好的字反而弹不出来。
+                if shiftHeld || wasHeld { self.lastKeySelect = Date() }
             } else if event.type == .leftMouseDown {
-                self.mouseDownAt = Date()
                 self.mouseDownPoint = NSEvent.mouseLocation
-                self.lastGesture = Date()
                 // 点到浮窗以外的地方 → 视为"不看了"：立刻收窗并抑制这段文字。
                 // （全局监视器收不到自己窗口里的事件，所以点浮窗内部不会走到这里）
                 if let pn = self.panel, pn.isVisible {
@@ -1260,12 +1293,9 @@ final class SelectionPopupController {
                                   NSEvent.mouseLocation.y - self.mouseDownPoint.y) > 4
                 let isDouble = Date().timeIntervalSince(self.lastClickUp) < 0.45
                 self.lastClickUp = Date()
-                self.lastGesture = Date()
                 // 只有"拖动"和"双击"才算用户在**选字**；单击只是点点界面/切换窗口，
                 // 不能拿它当作"重新选了一遍"（否则切 App 点一下就又把抑制解除了）
-                if moved || isDouble { self.lastSelectGesture = Date() }
-            } else {
-                self.lastGesture = Date()
+                if moved || isDouble { self.lastDragSelect = Date() }
             }
         }) {
             gestureMonitors.append(m)
@@ -1276,6 +1306,21 @@ final class SelectionPopupController {
         gestureMonitors.forEach { NSEvent.removeMonitor($0) }
         gestureMonitors.removeAll()
         modifierHeld = false
+    }
+
+    /// 浮窗可见期间，允许按 **Esc** 立刻收起它（键盘用户唯一的出口）。
+    /// ⚠️ 只在浮窗可见时挂、一收窗就摘 —— 全局键盘监视器会让**所有**按键都经过我们进程，
+    ///    常驻不合适。而且这里**只判断键码是不是 53（Esc），不读取、不记录任何按键内容**。
+    private func installEscapeMonitor() {
+        guard escapeMonitor == nil else { return }
+        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53 else { return }
+            self.hideNaturally(reason: "用户按了 Esc")
+        }
+    }
+
+    private func removeEscapeMonitor() {
+        if let m = escapeMonitor { NSEvent.removeMonitor(m); escapeMonitor = nil }
     }
 
     /// 选区所在元素是不是"可编辑控件"（地址栏/输入框/搜索框/聊天框）。
@@ -1330,6 +1375,7 @@ final class SelectionPopupController {
     }
 
     func showPopup(text: String, anchor: NSRect?) {
+        popupBundle = lastFrontBundle      // 记住这段文字属于谁（抑制归属看它，不看"当前前台是谁"）
         model.selectedText = text
         model.resultText = ""
         model.errorMsg = nil
@@ -1345,6 +1391,7 @@ final class SelectionPopupController {
         panel.orderFront(nil)
         // ③ 自动翻译：token 一变，浮窗视图里的 .task(id:) 就重新跑一次，不用手点「翻译」
         model.autoTranslateToken += 1
+        installEscapeMonitor()
     }
 
     /// 浮窗位置：优先贴选区矩形下方；下方不够就翻到上方；全程钳在屏幕可视区内。
@@ -1392,7 +1439,11 @@ final class SelectionPopupController {
         let t = model.selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !t.isEmpty {
             suppressText = t
-            suppressBundle = lastFrontBundle
+            // ⚠️ 必须用 popupBundle（弹窗时那个 App），**不能用 lastFrontBundle**：
+            //    切 App 时 poll() 已经把 lastFrontBundle 改成新 App 了，用它会把抑制
+            //    记到新 App 名下 → 切回来时 bid 对不上 → 抑制失效 → 又弹。
+            //    这正是"点掉浮窗后切 App 回来必定弹窗"的根因。
+            suppressBundle = popupBundle.isEmpty ? lastFrontBundle : popupBundle
             suppressAt = Date()
         }
         hidePopup(reason: reason)
@@ -1404,6 +1455,7 @@ final class SelectionPopupController {
         lastText = ""
         resetPending()
         unreadableSince = nil
+        removeEscapeMonitor()
         guard let panel else { return }
         panel.alphaValue = 0
         panel.orderOut(nil)
@@ -1413,7 +1465,7 @@ final class SelectionPopupController {
     /// 哪怕它在原软件里还处于选中状态。等选区消失或换一段文字后才恢复。
     func dismissPopup() {
         suppressText = model.selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        suppressBundle = lastFrontBundle
+        suppressBundle = popupBundle.isEmpty ? lastFrontBundle : popupBundle
         suppressAt = Date()
         hidePopup(reason: "用户点了 X（已抑制这段文字）")
     }
