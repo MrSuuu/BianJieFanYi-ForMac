@@ -900,11 +900,6 @@ final class SelectionPopupController {
 
         let trimmed = blockedByEditable ? "" : found.text
         guard let elem, !trimmed.isEmpty else {
-            // 走到这里说明"这个 App 不给我们选区"。有一类 App 是**完全不用无障碍暴露内容**的
-            // （微信 4.x 最典型：它的窗口树只有 6 个节点，聊天区/输入框全自绘），
-            // 对它们唯一的取词方式是像 PopClip 那样**合成一次 ⌘C** 把选中内容复制出来。
-            // 只有"用户刚拖选过"才会触发（见 tryCopyFallback 内部的前置条件）。
-            if !blockedByEditable { tryCopyFallback(bundleID: bid) }
             // ---- 读数中断（读不到 / 空 / 落在输入框里）----
             // ⚠️ **不要一断就收窗**！浏览器重建无障碍树、焦点切换都会闪断好几拍，
             //    旧代码一断就 maybeHide()，用户看到的就是"浮窗刚出来一秒就自己没了"。
@@ -1436,106 +1431,6 @@ final class SelectionPopupController {
         }
         hosting = h
         panel = p
-    }
-
-    // MARK: 合成 ⌘C 兜底（给"完全不用无障碍暴露选区"的 App 用）
-
-    private var lastCopyFallback = Date.distantPast
-    private var copyFallbackInFlight = false
-    private var lastFallbackDrag = Date.distantPast   // 上次为哪一次"拖选"做过兜底
-    /// 已经被识别为"读不到 AX 选区"的 App（仅用于日志/诊断）
-    private var axDeadApps: Set<String> = []
-
-    /// 兜底取词：模拟一次 ⌘C，把选中内容从剪贴板读回来。
-    ///
-    /// 为什么需要它：微信 4.x 这类 App 的内容区是**完全自绘**的，无障碍树里只有窗口和几个按钮
-    /// （实测 `AXFocusedUIElement` 直接返回 -25212，整棵树 6 个节点），
-    /// 任何"读 AX 选区"的方案在这里都是死路。PopClip / 欧路等取词工具对这类 App
-    /// 通用做法就是合成 ⌘C + 读剪贴板。
-    ///
-    /// 副作用控制：
-    /// · 剪贴板**完整备份并还原**（含图片/文件，不只是文本）
-    /// · 只在"用户刚用鼠标拖选过"时触发，且有 1.5s 节流，不会反复合成按键
-    /// · 剪贴板监听只对图片反应，所以这次文本复制不会误触发它
-    private func tryCopyFallback(bundleID: String) {
-        let enabled = UserDefaults.standard.object(forKey: "copyFallback") as? Bool ?? true
-        guard enabled else { return }
-        guard !copyFallbackInFlight else { return }
-        let now = Date()
-        guard now.timeIntervalSince(lastCopyFallback) > 1.5 else { return }
-        // 必须是"刚刚拖选过"——否则只是普通点击/切窗口也会被我们合成一次 ⌘C
-        guard now.timeIntervalSince(lastDragSelect) < 1.5 else { return }
-        guard lastDragSelect > lastAppSwitch else { return }
-        // 同一次拖选只兜底一次。否则在"读不到选区"的 App 里（比如微信），
-        // poll 每 0.2s 走一次这个分支，就会每 1.5s 给人家发一次 ⌘C，持续骚扰。
-        guard lastDragSelect != lastFallbackDrag else { return }
-
-        copyFallbackInFlight = true
-        lastCopyFallback = now
-        lastFallbackDrag = lastDragSelect
-        axDeadApps.insert(bundleID)
-
-        let board = NSPasteboard.general
-        let before = board.changeCount
-        // 完整备份：不能只存字符串 —— 用户可能刚截图，剪贴板里是图片，
-        // 只还原文本会把那张截图弄丢。这里把所有 item 的每种类型都复制一份。
-        let backup: [NSPasteboardItem] = (board.pasteboardItems ?? []).map { item in
-            let copy = NSPasteboardItem()
-            for type in item.types {
-                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
-            }
-            return copy
-        }
-
-        sendCommandC()
-        debugLog("copyFallback", "合成 ⌘C 取词（\(bundleID)）")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-            guard let self else { return }
-            let after = board.changeCount
-            let text = (board.string(forType: .string) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            // 还原剪贴板：稍等一点再还，避免打断目标 App 还没写完的复制
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                guard !backup.isEmpty else { return }
-                board.clearContents()
-                board.writeObjects(backup)
-            }
-            self.copyFallbackInFlight = false
-            guard after != before, !text.isEmpty else {
-                self.debugLog("copyFallback", "没拿到内容（可能并没有选中文字）")
-                return
-            }
-            self.debugLog("copyFallback", "拿到 \(text.count) 字符")
-            self.acceptFallbackText(text, bundleID: bundleID)
-        }
-    }
-
-    /// 合成 **⌘C**（kVK_ANSI_C = 8）。CGEvent 走 cghidEventTap 是系统级事件，
-    /// 目标 App 分不出真假；需要辅助功能权限（我们本来就有）。
-    private func sendCommandC() {
-        let src = CGEventSource(stateID: .hidSystemState)
-        let key = CGKeyCode(kVK_ANSI_C)
-        guard let down = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: true),
-              let up = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: false) else { return }
-        down.flags = .maskCommand
-        up.flags = .maskCommand
-        down.post(tap: .cghidEventTap)
-        usleep(25_000)          // 太短的按下-松开有些 App 会漏掉（25ms 是实测够用的最小值）
-        up.post(tap: .cghidEventTap)
-    }
-
-    /// 兜底拿到的文字：走"抑制检查 + 弹窗"。防抖这里不需要（拖动早已结束）。
-    private func acceptFallbackText(_ text: String, bundleID bid: String) {
-        guard text.count >= 2 else { return }        // 单字符几乎总是噪音（图标文本之类）
-        guard text != lastText else { return }        // 同一段已经在显示
-        if text == suppressText, bid == suppressBundle {
-            debugLog("suppressed", "\(text.count) 字符（兜底）")
-            return
-        }
-        lastText = text
-        lastElement = nil                             // 合成复制拿不到 AX 元素
-        showPopup(text: text, anchor: nil)            // 锚点退回鼠标位置（用户刚在这附近松手）
     }
 
     /// 自然收窗（切 App、点到别处、读数长时间中断）：顺手把当前这段文字标记为"看过了"，
@@ -2712,7 +2607,6 @@ struct EngineSettingsView: View {
     @AppStorage("accentTheme") private var accentTheme = "glass"
     @AppStorage("selectionPopup") private var selectionPopup = false
     @AppStorage("popupInEditable") private var popupInEditable = false   // 输入框内也弹（默认关）
-    @AppStorage("copyFallback") private var copyFallback = true          // 对不暴露无障碍的 App 合成 ⌘C 取词
     @AppStorage("popupClearness") private var popupClearness = 0.5        // 选区浮窗
     @AppStorage("mainClearness") private var mainClearness = 0.30         // 翻译窗口
     @AppStorage("settingsClearness") private var settingsClearness = 0.30 // 设置窗口（就是本窗口）
@@ -2775,9 +2669,6 @@ struct EngineSettingsView: View {
                             SelectionPopupController.shared.stop()
                         }
                     }
-                Toggle("自动兼容取不到内容的软件", isOn: $copyFallback)
-                Text("有些软件（微信、部分游戏或自绘界面）完全不对外暴露文字内容，读不到「选中了什么」。打开后会改用「模拟复制」取词：你在里面选中文字，程序替你按一次 ⌘C 把内容取出来，剪贴板会原样还给你（不影响你之后粘贴）。")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
                 Toggle("在输入框里也弹浮窗", isOn: $popupInEditable)
                 Text("默认关：地址栏、搜索框、聊天输入框经常被系统或输入法「自动选中」，在那里弹窗就是骚扰。需要就打开。")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
