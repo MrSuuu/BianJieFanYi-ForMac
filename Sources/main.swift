@@ -777,8 +777,10 @@ final class SelectionPopupController {
     private var mouseInside = false
     private var manualAccessPids: Set<Int32> = []   // 已打过无障碍提示的进程
     private var axHintResult = ""                   // 设置无障碍提示的返回码（诊断用）
-    private var missStreak = 0                      // 连续"有操作但找不到选区"的次数
-    private var lastProbe = Date.distantPast        // 诊断导出的节流
+    private var missStreak = 0                      // 连续"有选字动作但找不到选区"的次数
+    private var probeAt: [String: Date] = [:]       // 诊断导出：每个 App 各自节流（别互相覆盖）
+    private var emptySince: Date?                   // 选区为空的起始时刻（防"闪断"用）
+    private var suppressAt = Date.distantPast       // 抑制是什么时候生效的
     private var pendingText = ""                    // 防抖：正在观察中的选区内容
     private var pendingSince = Date.distantPast
     private var suppressText = ""                   // 被用户手动关掉的选区内容（不再弹）
@@ -800,6 +802,9 @@ final class SelectionPopupController {
     private let kAXEditableAncestor = "AXEditableAncestor" as CFString
     private let kAXSelectedTextRange = "AXSelectedTextRange" as CFString
     private let kAXStringForRange = "AXStringForRange" as CFString               // 参数化属性
+    private let kAXSelectedTextMarkerRange = "AXSelectedTextMarkerRange" as CFString
+    private let kAXStringForTextMarkerRange = "AXStringForTextMarkerRange" as CFString
+    private let kAXAttributedStringForTextMarkerRange = "AXAttributedStringForTextMarkerRange" as CFString
     private let kAXManualAccessibility = "AXManualAccessibility" as CFString      // Chromium 系认这个
     private let kAXEnhancedUserInterface = "AXEnhancedUserInterface" as CFString  // WebKit/Safari 认这个
 
@@ -834,9 +839,9 @@ final class SelectionPopupController {
     }
 
     private func poll() {
-        guard let front = NSWorkspace.shared.frontmostApplication else { hidePopup(); return }
+        guard let front = NSWorkspace.shared.frontmostApplication else { hidePopup(reason: "拿不到前台 App"); return }
         // 自己的窗口不监听（那边用主界面自己的逻辑）
-        if front.bundleIdentifier == "com.zegeyoudaoli.translator" { hidePopup(); return }
+        if front.bundleIdentifier == "com.zegeyoudaoli.translator" { hidePopup(reason: "前台是自己"); return }
         debugLog("front", front.bundleIdentifier ?? "?")
         // 换 App = 换了上下文：解除"这段文字被手动关过"的抑制，否则跨 App 会被一直拉黑
         // 注意：这里**不能**在换 App 时清掉"已被手动关掉"的记录。
@@ -898,19 +903,35 @@ final class SelectionPopupController {
 
         let trimmed = found.text
         if trimmed.isEmpty {
-            // 选区没了 → 清掉"已弹过 / 已被手动关掉"的记录，否则同一段文字以后再选就永远不弹了
-            // （Chromium 里点别处常常仍返回旧选区值，所以这里的复位必须做）
-            // 但鼠标还停在浮窗上时先别收起，免得用户正要点按钮时窗口消失
+            // ⚠️ 选区"空"不一定是真没选 —— 浏览器重排无障碍树时经常闪断一拍。
+            // 之前的代码见到空就直接收窗、清记录，于是出现两个毛病：
+            //   · 浮窗刚弹出来一秒就自己消失（闪断把它收掉了）
+            //   · 切 App 回来后抑制被顺手清掉 → 又弹
+            // 现在统一加"持续时间"判定：闪断（<1.2s）不当事，真消失才处理。
             resetPending()
-            // 只有**同一个 App** 里选区真的消失了，才清掉抑制。
-            // 否则会出现：在 A 里点掉浮窗 → 切到 B（B 里没选区）→ 顺手把 A 的抑制清掉
-            // → 切回 A 又弹（泽哥报的"不是每次都弹"就是这个）。
-            if bid == suppressBundle { suppressText = ""; suppressBundle = "" }
-            lastText = ""
-            if !mouseInside { hidePopup() }
+            let now = Date()
+            let since = emptySince ?? now
+            emptySince = since
+            let emptyFor = now.timeIntervalSince(since)
+
+            // 真·取消选中（持续 2.5s 才算）→ 清掉抑制，让以后重新选还能弹
+            if emptyFor > 2.5, bid == suppressBundle { suppressText = ""; suppressBundle = "" }
+            // 持续 1.2s 才算选区真的没了 → 允许下一次弹同一段
+            if emptyFor > 1.2 {
+                lastText = ""
+                if !mouseInside { hidePopup(reason: "选区消失(持续\(String(format: "%.1f", emptyFor))s)") }
+            }
             return
         }
+        emptySince = nil
         if trimmed == lastText { return }       // 同一选区已经弹过了
+        // 用户"重新选了一次"（拖动/双击）→ 解除抑制。
+        // 这条是泽哥要的："点掉之后我再手动重选同一段，应该还能弹"。
+        // 关键在"拖动/双击"才算重新选，单击（比如切窗口点一下）不算。
+        if !suppressText.isEmpty, !suppressBundle.isEmpty,
+           lastSelectGesture > suppressAt.addingTimeInterval(0.5) {
+            suppressText = ""; suppressBundle = ""
+        }
         // 用户手动关掉过这段 → 不再弹（哪怕它还选着）。
         // 比对时连 App 一起看：在 Discord 关掉的文字，到别的 App 里选中照样该弹。
         if trimmed == suppressText, bid == suppressBundle {
@@ -979,10 +1000,13 @@ final class SelectionPopupController {
         }
         // 用户明明做了选区动作、却连续多次都找不到 → 说明这个 App 的读法我没吃准，
         // 直接把它的无障碍树导出来（泽哥只需在 Safari 里选一次字，文件自动出现）
+        // 只统计"用户刚做了选字动作（拖动/双击）之后"的失败，
+        // 否则"压根没选东西"也会被算成失败，白白导出报告（上一版就被 WorkBuddy 覆盖了 Safari 的）
         missStreak += 1
-        if missStreak >= 6, Date().timeIntervalSince(lastProbe) > 30,
-           Date().timeIntervalSince(lastGesture) < 3.0 {
-            lastProbe = Date()
+        let selectGestureFresh = Date().timeIntervalSince(lastSelectGesture) < 2.5
+        if missStreak >= 6, selectGestureFresh,
+           Date().timeIntervalSince(probeAt[bundleID] ?? .distantPast) > 30 {
+            probeAt[bundleID] = Date()
             dumpAXProbe(pid: pid, bundleID: bundleID, systemFocused: systemFocused, appFocused: appFocused)
         }
         return Selection(errorCode: "未找到选区")
@@ -1015,7 +1039,31 @@ final class SelectionPopupController {
             if !t.isEmpty { return t }
         }
         guard webKitRange else { return nil }
-        return textForSelectedRange(of: e)
+        // ② 常规 WebKit 路线：选区范围 → 参数化取字
+        if let t = textForSelectedRange(of: e) { return t }
+        // ③ 兜底：文本标记范围（VoiceOver 那套 API）。
+        //    Safari/WebKit 有可能只暴露这个而不暴露 AXSelectedTextRange，
+        //    多试一条成本很低，但能救回一整个浏览器。
+        return textForSelectedMarkerRange(of: e)
+    }
+
+    /// WebKit/Safari 的另一条路：`AXSelectedTextMarkerRange` + 参数化取字
+    private func textForSelectedMarkerRange(of e: AXUIElement) -> String? {
+        guard let marker = attribute(e, kAXSelectedTextMarkerRange) else { return nil }
+        for attr in [kAXStringForTextMarkerRange, kAXAttributedStringForTextMarkerRange] {
+            var out: CFTypeRef?
+            let err = AXUIElementCopyParameterizedAttributeValue(e, attr, marker, &out)
+            guard err == .success else {
+                debugLog("markerFail", "err=\(err.rawValue)")
+                continue
+            }
+            let str = (out as? String) ?? (out as? NSAttributedString)?.string
+            if let str {
+                let t = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { return t }
+            }
+        }
+        return nil
     }
 
     /// 把一个 App 的无障碍树关键信息导出到 /tmp/yi-axprobe.txt。
@@ -1052,8 +1100,11 @@ final class SelectionPopupController {
         }
         out += "\n共访问 \(visited) 个节点\n"
 
+        // 两份：一份全局最新的（方便直接读），一份按 App 归档（避免被别的 App 覆盖）
+        let safeName = bundleID.replacingOccurrences(of: "/", with: "_")
         try? out.write(toFile: "/tmp/yi-axprobe.txt", atomically: true, encoding: .utf8)
-        debugLog("probe", "已导出 /tmp/yi-axprobe.txt（\(visited) 节点）")
+        try? out.write(toFile: "/tmp/yi-axprobe-\(safeName).txt", atomically: true, encoding: .utf8)
+        debugLog("probe", "已导出诊断（\(visited) 节点）→ /tmp/yi-axprobe-\(safeName).txt")
     }
 
     /// 详细描述：角色 + 暴露的全部属性名 + 选区的三种读法结果（诊断的核心信息）
@@ -1160,6 +1211,10 @@ final class SelectionPopupController {
     // MARK: 用户主动操作检测
 
     private var lastGesture = Date.distantPast
+    private var lastSelectGesture = Date.distantPast   // 明确的"选字动作"：拖动 或 双击
+    private var mouseDownAt = Date.distantPast
+    private var mouseDownPoint = NSPoint.zero
+    private var lastClickUp = Date.distantPast
     private var modifierHeld = false
     private let gestureWindow: TimeInterval = 1.6
     private var gestureMonitors: [Any] = []
@@ -1179,6 +1234,7 @@ final class SelectionPopupController {
     private func installGestureMonitors() {
         guard gestureMonitors.isEmpty else { return }
         let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .flagsChanged]
+        // leftMouseDown 用来记录"按下点"，配合 up 判断这是拖动还是单击
         if let m = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
             guard let self else { return }
             if event.type == .flagsChanged {
@@ -1186,6 +1242,19 @@ final class SelectionPopupController {
                 let held = !mods.intersection([.shift, .command, .option, .control]).isEmpty
                 self.modifierHeld = held
                 self.lastGesture = Date()      // 按下和松开都算一次操作
+            } else if event.type == .leftMouseDown {
+                self.mouseDownAt = Date()
+                self.mouseDownPoint = NSEvent.mouseLocation
+                self.lastGesture = Date()
+            } else if event.type == .leftMouseUp {
+                let moved = hypot(NSEvent.mouseLocation.x - self.mouseDownPoint.x,
+                                  NSEvent.mouseLocation.y - self.mouseDownPoint.y) > 4
+                let isDouble = Date().timeIntervalSince(self.lastClickUp) < 0.45
+                self.lastClickUp = Date()
+                self.lastGesture = Date()
+                // 只有"拖动"和"双击"才算用户在**选字**；单击只是点点界面/切换窗口，
+                // 不能拿它当作"重新选了一遍"（否则切 App 点一下就又把抑制解除了）
+                if moved || isDouble { self.lastSelectGesture = Date() }
             } else {
                 self.lastGesture = Date()
             }
@@ -1252,7 +1321,7 @@ final class SelectionPopupController {
     }
 
     private func maybeHide() {
-        if !mouseInside { hidePopup() }
+        if !mouseInside { hidePopup(reason: "没读到选区/焦点") }
     }
 
     func showPopup(text: String, anchor: NSRect?) {
@@ -1310,9 +1379,12 @@ final class SelectionPopupController {
         panel = p
     }
 
-    func hidePopup() {
+    func hidePopup(reason: String = "?") {
+        // 记下是谁把浮窗收掉的 —— "刚弹出来就消失"这类问题全靠这个定位
+        debugLog("hide", reason)
         lastText = ""
         resetPending()
+        emptySince = nil
         guard let panel else { return }
         panel.alphaValue = 0
         panel.orderOut(nil)
@@ -1323,7 +1395,8 @@ final class SelectionPopupController {
     func dismissPopup() {
         suppressText = model.selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
         suppressBundle = lastFrontBundle
-        hidePopup()
+        suppressAt = Date()
+        hidePopup(reason: "用户点了 X（已抑制这段文字）")
     }
 }
 
