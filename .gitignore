@@ -1,0 +1,20 @@
+# 构建中间产物 / app 本体（要下就用 dist/ 里的发布包）
+.build/
+译.app/
+
+# ⚠️ 签名私钥：绝对不能进版本库
+.signing/
+*.keychain-db
+*.p12
+*.key
+
+# 根目录下零散打的旧 zip（dist/ 里的发布包是正式产物，要提交）
+/*.zip
+
+# 系统垃圾
+.DS_Store
+__MACOSX/
+._*
+
+# Tools 里编译出来的二进制（源码 makeicon.swift 在）
+Tools/makeicon
