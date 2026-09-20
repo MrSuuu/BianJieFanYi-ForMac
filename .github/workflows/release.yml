@@ -29,11 +29,13 @@ jobs:
 
       - name: 校验发布包存在
         run: |
-          # tag 名 v3.1 → 版本号 3.1 → 找 dist/Yi-macOS-3.1.zip
+          # tag 名 v3.2 → 版本号 3.2 → 找 dist/ 里任意 *macOS-3.2.zip
+          # 用通配符而不是写死文件名：应用改过名（Yi → BianJieFanYi），
+          # 写死的话每次改名都得回来改工作流，一不留神就是一次红的失败。
           VER="${GITHUB_REF_NAME#v}"
-          ZIP="dist/Yi-macOS-${VER}.zip"
-          if [ ! -f "$ZIP" ]; then
-            echo "::error::找不到 $ZIP —— 请先在本地跑 'bash package.sh' 并把产物提交上来"
+          ZIP="$(ls dist/*macOS-$VER.zip 2>/dev/null | head -1)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::找不到 dist/*macOS-$VER.zip —— 请先在本地跑 'bash package.sh' 并把产物提交上来"
             echo "当前 dist/ 内容："; ls -l dist/ || true
             exit 1
           fi
