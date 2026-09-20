@@ -60,11 +60,20 @@ jobs:
           TXT
           )
           TITLE="便捷翻译 $GITHUB_REF_NAME"
+          # gh release view 查不到「draft」状态的 release，但以同名 tag 创建时又会冲突
+          # （推送 annotated tag 时 GitHub 有时会先自动建一个 release）。
+          # 所以这里做双保险：先试 view→edit，不行就 create，create 再失败就回头 edit 并强制发布。
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             # 已存在（比如改了文案后重推 tag 刷新）→ 更新标题/说明，并覆盖附件
-            gh release edit "$GITHUB_REF_NAME" --title "$TITLE" --notes "$NOTES"
+            gh release edit "$GITHUB_REF_NAME" --title "$TITLE" --notes "$NOTES" --draft=false
             gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" "$ZIP" \
-              --title "$TITLE" --notes "$NOTES" --generate-notes
+          elif ! gh release create "$GITHUB_REF_NAME" "$ZIP" \
+                 --title "$TITLE" --notes "$NOTES" --generate-notes; then
+            # create 失败：极可能是已存在同名 release（含 draft，view 看不到）
+            echo "::warning::create 失败，改用 edit 并强制发布"
+            gh release edit "$GITHUB_REF_NAME" --title "$TITLE" --notes "$NOTES" --draft=false
+            gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
           fi
+          echo "✓ Release $GITHUB_REF_NAME 已就绪"
+          gh release view "$GITHUB_REF_NAME" --json name,isDraft,assets \
+            --template '{{.name}} draft={{.isDraft}} 附件={{range .assets}}{{.name}} {{end}}{{"\n"}}'
