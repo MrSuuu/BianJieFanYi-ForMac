@@ -2546,12 +2546,17 @@ struct YiApp: App {
 /// 并把下面 setFill 改成 NSColor.white 即可 —— 但浅色菜单栏下会基本看不见。
 enum StatusBarIcon {
     static let image: NSImage = {
-        // 18×18 是菜单栏图标的常见尺寸；方块留 1pt 边距，避免贴满显得臃肿
+        // 画布 18×18 pt（菜单栏图标的标准尺寸）。
+        // ⚠️ 方块尺寸是量出来的、不是猜的：把真实菜单栏截图按 @2x 换算后实测，
+        //    原先方块只有 **15pt 高**，而旁边微信 16pt、系统图标多为 17~18pt，
+        //    加上方形比圆形更"显小"，所以看着明显比邻居小一号。
+        //    现在留 0.5pt 边距 → **17pt**，与主流水准对齐。
         let side: CGFloat = 18
         let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
-            let box = rect.insetBy(dx: 1, dy: 1.5)
+            let box = rect.insetBy(dx: 0.5, dy: 0.5)
             NSColor.black.setFill()
-            NSBezierPath(roundedRect: box, xRadius: 4.5, yRadius: 4.5).fill()
+            // 圆角跟着放大（保持与边长约 0.29 的比例，接近 macOS 的 squircle 观感）
+            NSBezierPath(roundedRect: box, xRadius: 5.0, yRadius: 5.0).fill()
 
             // 关键一步：用 destinationOut 把「译」字"挖"掉 → 字的位置变成透明（镂空）
             guard let ctx = NSGraphicsContext.current?.cgContext else { return true }
