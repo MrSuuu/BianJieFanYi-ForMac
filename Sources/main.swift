@@ -945,7 +945,11 @@ final class SelectionPopupController {
         }
         // 4) 兜底：在焦点窗口里做"有预算的"广度搜索。
         //    AX 调用是跨进程 IPC，不能随便全树扫，所以限制预算（节点数 + 间隔）。
-        if let hit = descentSearch(pid: pid) { return Selection(text: hit.0, element: hit.1, source: .descent) }
+        var roots: [AXUIElement] = []
+        if let e = systemFocused { roots.append(e) }
+        if let e = appFocused { roots.append(e) }
+        if let w = attribute(AXUIElementCreateApplication(pid), kAXFocusedWindow) as! AXUIElement? { roots.append(w) }
+        if let hit = descentSearch(roots: roots) { return Selection(text: hit.0, element: hit.1, source: .descent) }
         // 一个都没找到 → 把"焦点元素是什么角色"记下来，方便定位是哪类 App 不配合
         debugLog("focusRoles", "system=\(role(of: systemFocused)) app=\(role(of: appFocused))")
         return Selection(errorCode: "未找到选区")
@@ -976,26 +980,32 @@ final class SelectionPopupController {
     private let descentInterval: TimeInterval = 0.8      // 兜底搜索最小间隔，防止每 0.2s 扫一次树
     private let descentNodeBudget = 160                  // 单次最多访问多少个节点
 
-    private func descentSearch(pid: pid_t) -> (String, AXUIElement)? {
+    /// 在若干"根"的子树里找选区。**从焦点元素开始**很关键：
+    /// 浏览器把焦点元素报成 AXWebArea（整页），选区就在它的子树里；
+    /// 若从窗口开始扫，预算会先被工具栏/侧栏/标签栏吃掉，等不到内容区就用光了。
+    private func descentSearch(roots: [AXUIElement]) -> (String, AXUIElement)? {
         let now = Date()
         guard now.timeIntervalSince(lastDescent) >= descentInterval else { return nil }
         lastDescent = now
 
-        let app = AXUIElementCreateApplication(pid)
-        guard let win = attribute(app, kAXFocusedWindow) as! AXUIElement? else { return nil }
-        var queue: [AXUIElement] = [win]
         var visited = 0
-        while let node = queue.first, visited < descentNodeBudget {
-            queue.removeFirst()
-            visited += 1
-            if let t = selectedText(of: node) { return (t, node) }
-            if let kids = attribute(node, kAXChildren) as? [AXUIElement] {
-                queue.append(contentsOf: kids.prefix(24))     // 单个节点最多展开 24 个子节点
+        for root in roots {
+            var queue: [(AXUIElement, Int)] = [(root, 0)]
+            while let (node, depth) = queue.first, visited < descentNodeBudget {
+                queue.removeFirst()
+                visited += 1
+                if let t = selectedText(of: node) { return (t, node) }
+                if depth < descentMaxDepth, let kids = attribute(node, kAXChildren) as? [AXUIElement] {
+                    queue.append(contentsOf: kids.prefix(20).map { ($0, depth + 1) })
+                }
             }
+            if visited >= descentNodeBudget { break }
         }
         debugLog("descent", "扫了 \(visited) 个节点没找到选区")
         return nil
     }
+
+    private let descentMaxDepth = 6       // 网页 DOM 很深，但选区不会埋太深，6 层够用
 
     // MARK: 用户主动操作检测
 
