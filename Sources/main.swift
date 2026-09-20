@@ -779,7 +779,8 @@ final class SelectionPopupController {
     private var axHintResult = ""                   // 设置无障碍提示的返回码（诊断用）
     private var missStreak = 0                      // 连续"有选字动作但找不到选区"的次数
     private var probeAt: [String: Date] = [:]       // 诊断导出：每个 App 各自节流（别互相覆盖）
-    private var emptySince: Date?                   // 选区为空的起始时刻（防"闪断"用）
+    private var unreadableSince: Date?              // "选区读不到"的起始时刻（闪断/被中断都算）
+    private var lastAnchorRect: NSRect?             // 上一次弹窗锚点（判断"点到浮窗以外"）
     private var suppressAt = Date.distantPast       // 抑制是什么时候生效的
     private var pendingText = ""                    // 防抖：正在观察中的选区内容
     private var pendingSince = Date.distantPast
@@ -849,7 +850,12 @@ final class SelectionPopupController {
         // 选区还在、又弹一次 —— 用户视角就是"关不掉、一直弹"。
         // 抑制按 (App, 文字) 绑定，换 App 各自保留；只有选区真的消失才清空。
         let bid = front.bundleIdentifier ?? "?"
-        lastFrontBundle = bid
+        if bid != lastFrontBundle {
+            lastFrontBundle = bid
+            // 切到别的 App → 收窗（并抑制这段文字）。不收的话切回来它会自己弹，
+            // 或者在新 App 里挂着一个属于旧 App 的浮窗。
+            if panel?.isVisible == true { hideNaturally(reason: "切到了别的 App") }
+        }
         let trusted = AXIsProcessTrusted()
         debugLog("trust", trusted ? "yes" : "no")
         guard trusted else { return }
@@ -874,57 +880,43 @@ final class SelectionPopupController {
 
         let systemWide = AXUIElementCreateSystemWide()
 
-        // ①【防乱弹】必须是"用户主动做的选区"才弹。
-        //    光看 AXSelectedText 非空是不够的：很多情况不是用户选的 —— 点地址栏时
-        //    系统自动全选、输入法组字时把候选标成选中、网页加载完自己设个选区……
-        //    这些都算"没人要求翻译"，弹出来就是骚扰。
-        if !userGestureRecently {
-            debugLog("noGesture", "跳过（非用户主动操作）")
-            resetPending(); maybeHide(); return
-        }
-
-        // ②【含 Safari】多来源找选区：不同 App 把 AXSelectedText 挂在不同层级上。
-        //    Chromium 挂在焦点元素上；WebKit/Safari 常挂在焦点元素的祖先（AXWebArea），
-        //    所以只查焦点元素的话，Safari 里选中网页文字永远取不到 → 表现为"不生效"。
+        // ②【含 Safari】多来源找选区：不同 App 把选区挂在不同层级上。
+        //    Chromium 挂在焦点元素上；WebKit/Safari 挂在祖先 AXWebArea / 文本标记范围上。
+        //    取不到就说明"这一轮读不到"，统一走下面的"读数中断"计时 —— 注意也**不能**立刻收窗。
         let found = readSelection(pid: pid, systemWide: systemWide, bundleID: bid)
         debugLog("selFrom", found.source.rawValue)
         if !found.text.isEmpty { missStreak = 0 }
-        guard let elem = found.element, !found.text.isEmpty else {
-            debugLog("selErr", found.errorCode)
-            resetPending(); maybeHide(); return
-        }
 
-        // ③【防乱弹】选区落在可编辑控件里（地址栏、聊天输入框、搜索框）→ 不弹。
-        //    这些地方系统/输入法经常会"帮你选中"，而且用户在那里通常是要打字不是要翻译。
-        if isEditable(elem), !UserDefaults.standard.bool(forKey: "popupInEditable") {
-            debugLog("skipEditable", "跳过（选区在可编辑控件内）")
-            resetPending(); maybeHide(); return
-        }
+        // ③【防乱弹·只用于"要不要弹"，绝不用于"要不要收"】
+        //    选区落在可编辑控件里（地址栏/搜索框/聊天输入框）→ 不弹。
+        //    ⚠️ 这里以前调 maybeHide() 把浮窗收了，导致"浮窗莫名其妙消失"，现在只 return。
+        let elem = found.element
+        let inEditable = elem.map { isEditable($0) } ?? false
+        let blockedByEditable = inEditable && !UserDefaults.standard.bool(forKey: "popupInEditable")
+        if blockedByEditable { debugLog("skipEditable", "跳过（选区在可编辑控件内）") }
 
-        let trimmed = found.text
-        if trimmed.isEmpty {
-            // ⚠️ 选区"空"不一定是真没选 —— 浏览器重排无障碍树时经常闪断一拍。
-            // 之前的代码见到空就直接收窗、清记录，于是出现两个毛病：
-            //   · 浮窗刚弹出来一秒就自己消失（闪断把它收掉了）
-            //   · 切 App 回来后抑制被顺手清掉 → 又弹
-            // 现在统一加"持续时间"判定：闪断（<1.2s）不当事，真消失才处理。
+        let trimmed = blockedByEditable ? "" : found.text
+        guard let elem, !trimmed.isEmpty else {
+            // ---- 读数中断（读不到 / 空 / 落在输入框里）----
+            // ⚠️ **不要一断就收窗**！浏览器重建无障碍树、焦点切换都会闪断好几拍，
+            //    旧代码一断就 maybeHide()，用户看到的就是"浮窗刚出来一秒就自己没了"。
+            //    现在给个宽限：连续 2.5 秒都读不到，才认为用户已经不要它了。
             resetPending()
             let now = Date()
-            let since = emptySince ?? now
-            emptySince = since
-            let emptyFor = now.timeIntervalSince(since)
-
-            // 真·取消选中（持续 2.5s 才算）→ 清掉抑制，让以后重新选还能弹
-            if emptyFor > 2.5, bid == suppressBundle { suppressText = ""; suppressBundle = "" }
-            // 持续 1.2s 才算选区真的没了 → 允许下一次弹同一段
-            if emptyFor > 1.2 {
-                lastText = ""
-                if !mouseInside { hidePopup(reason: "选区消失(持续\(String(format: "%.1f", emptyFor))s)") }
+            let since = unreadableSince ?? now
+            unreadableSince = since
+            let broken = now.timeIntervalSince(since)
+            if broken > 2.5 {
+                if panel?.isVisible == true { hideNaturally(reason: "读数中断 \(String(format: "%.1f", broken))s") }
+            } else if broken > 0.6 {
+                lastText = ""      // 断得够久了：允许同一段文字重新弹
             }
             return
         }
-        emptySince = nil
-        if trimmed == lastText { return }       // 同一选区已经弹过了
+        unreadableSince = nil
+
+        if trimmed == lastText { return }       // 这段已经弹着/弹过了
+
         // 用户"重新选了一次"（拖动/双击）→ 解除抑制。
         // 这条是泽哥要的："点掉之后我再手动重选同一段，应该还能弹"。
         // 关键在"拖动/双击"才算重新选，单击（比如切窗口点一下）不算。
@@ -939,7 +931,17 @@ final class SelectionPopupController {
             return
         }
 
-        // ④ 防抖：拖选过程中选区一直在变，只有内容连续 settleDelay 秒没变（说明松手了）
+        // ④【防乱弹】必须是"用户主动做的选区"才弹。
+        //    光看选区非空是不够的：点地址栏时系统自动全选、输入法组字时把候选标成选中、
+        //    网页加载完自己设个选区……这些都算"没人要求翻译"。
+        //    ⚠️ 这个判断只在"要不要弹"这一步生效；已经弹出来的浮窗不受它影响
+        //    （以前这里会 maybeHide()，于是 1.6 秒手势窗一过，浮窗就被自己收掉了）。
+        if !userGestureRecently {
+            debugLog("noGesture", "跳过弹出（非用户主动操作）")
+            return
+        }
+
+        // ⑤ 防抖：拖选过程中选区一直在变，只有内容连续 settleDelay 秒没变（说明松手了）
         //    才弹窗，避免"还没选完浮窗就跳出来"
         let now = Date()
         if trimmed != pendingText {
@@ -1246,6 +1248,13 @@ final class SelectionPopupController {
                 self.mouseDownAt = Date()
                 self.mouseDownPoint = NSEvent.mouseLocation
                 self.lastGesture = Date()
+                // 点到浮窗以外的地方 → 视为"不看了"：立刻收窗并抑制这段文字。
+                // （全局监视器收不到自己窗口里的事件，所以点浮窗内部不会走到这里）
+                if let pn = self.panel, pn.isVisible {
+                    let pt = NSEvent.mouseLocation
+                    let inAnchor = (self.lastAnchorRect?.insetBy(dx: -12, dy: -12).contains(pt)) ?? false
+                    if !inAnchor { self.hideNaturally(reason: "点击了浮窗以外的地方") }
+                }
             } else if event.type == .leftMouseUp {
                 let moved = hypot(NSEvent.mouseLocation.x - self.mouseDownPoint.x,
                                   NSEvent.mouseLocation.y - self.mouseDownPoint.y) > 4
@@ -1320,10 +1329,6 @@ final class SelectionPopupController {
         }
     }
 
-    private func maybeHide() {
-        if !mouseInside { hidePopup(reason: "没读到选区/焦点") }
-    }
-
     func showPopup(text: String, anchor: NSRect?) {
         model.selectedText = text
         model.resultText = ""
@@ -1333,7 +1338,9 @@ final class SelectionPopupController {
         model.detectedSource = nil
         if panel == nil { buildPanel() }
         guard let panel else { return }
-        panel.setFrame(popupFrame(anchor: anchor), display: true)
+        let frame = popupFrame(anchor: anchor)
+        lastAnchorRect = anchor
+        panel.setFrame(frame, display: true)
         panel.alphaValue = 1
         panel.orderFront(nil)
         // ③ 自动翻译：token 一变，浮窗视图里的 .task(id:) 就重新跑一次，不用手点「翻译」
@@ -1379,12 +1386,24 @@ final class SelectionPopupController {
         panel = p
     }
 
+    /// 自然收窗（切 App、点到别处、读数长时间中断）：顺手把当前这段文字标记为"看过了"，
+    /// 否则它会自己再弹回来 —— 用户视角就是"关不掉的浮窗"。
+    private func hideNaturally(reason: String) {
+        let t = model.selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty {
+            suppressText = t
+            suppressBundle = lastFrontBundle
+            suppressAt = Date()
+        }
+        hidePopup(reason: reason)
+    }
+
     func hidePopup(reason: String = "?") {
         // 记下是谁把浮窗收掉的 —— "刚弹出来就消失"这类问题全靠这个定位
         debugLog("hide", reason)
         lastText = ""
         resetPending()
-        emptySince = nil
+        unreadableSince = nil
         guard let panel else { return }
         panel.alphaValue = 0
         panel.orderOut(nil)
