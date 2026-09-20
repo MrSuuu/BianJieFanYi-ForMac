@@ -53,7 +53,7 @@ fi
 git commit -q -m "$MSG"
 git push -q origin main
 echo "✓ 已同步 $(git log --oneline -1)"
-echo "  https://github.com/MrSuuu/Yi-macOS"
+echo "  https://github.com/MrSuuu/BianJieFanYiForMac"
 
 # 提醒：改了源码，但发布包没跟着更新 → repo 里的 dist 已经落后于源码
 # 判断条件要同时看三件事，否则会误报：

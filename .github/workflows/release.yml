@@ -8,7 +8,7 @@ name: Release
 #
 # 发布新版本的完整流程：
 #   1. 本地改代码 → APP_VERSION 加一
-#   2. bash package.sh                    # 打出 dist/Yi-macOS-<版本>.zip
+#   2. bash package.sh                    # 打出 dist/BianJieFanYi-macOS-<版本>.zip
 #   3. git add -A && git commit && git push
 #   4. git tag v<版本> && git push origin v<版本>   # ← 这一步触发本工作流
 
@@ -56,7 +56,7 @@ jobs:
 
           > 首次使用「选区浮窗」需要到 **系统设置 → 隐私与安全性 → 辅助功能** 给「便捷翻译」打勾。
 
-          详细说明见 [README](https://github.com/MrSuuu/Yi-macOS#readme)。
+          详细说明见 [README](https://github.com/MrSuuu/BianJieFanYiForMac#readme)。
           TXT
           )
           TITLE="便捷翻译 $GITHUB_REF_NAME"
