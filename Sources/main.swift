@@ -775,7 +775,10 @@ final class SelectionPopupController {
     private var lastText: String = ""
     private var lastElement: AXUIElement?
     private var mouseInside = false
-    private var manualAccessPids: Set<Int32> = []   // 已打过 AXManualAccessibility 的进程
+    private var manualAccessPids: Set<Int32> = []   // 已打过无障碍提示的进程
+    private var axHintResult = ""                   // 设置无障碍提示的返回码（诊断用）
+    private var missStreak = 0                      // 连续"有操作但找不到选区"的次数
+    private var lastProbe = Date.distantPast        // 诊断导出的节流
     private var pendingText = ""                    // 防抖：正在观察中的选区内容
     private var pendingSince = Date.distantPast
     private var suppressText = ""                   // 被用户手动关掉的选区内容（不再弹）
@@ -855,8 +858,12 @@ final class SelectionPopupController {
         let pid = front.processIdentifier
         if !manualAccessPids.contains(pid) {
             let appElem = AXUIElementCreateApplication(pid)
-            AXUIElementSetAttributeValue(appElem, kAXManualAccessibility, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(appElem, kAXEnhancedUserInterface, kCFBooleanTrue)
+            // 超时很关键：默认 AX 调用会等对方 App 响应，对方忙/卡时能拖住我们主线程好几秒，
+            // 表现就是浮窗"时灵时不灵"甚至整个 app 卡住。0.5s 足够正常响应。
+            AXUIElementSetMessagingTimeout(appElem, 0.5)
+            let r1 = AXUIElementSetAttributeValue(appElem, kAXManualAccessibility, kCFBooleanTrue)
+            let r2 = AXUIElementSetAttributeValue(appElem, kAXEnhancedUserInterface, kCFBooleanTrue)
+            axHintResult = "Manual=\(r1.rawValue) Enhanced=\(r2.rawValue)"
             manualAccessPids.insert(pid)
         }
 
@@ -874,8 +881,9 @@ final class SelectionPopupController {
         // ②【含 Safari】多来源找选区：不同 App 把 AXSelectedText 挂在不同层级上。
         //    Chromium 挂在焦点元素上；WebKit/Safari 常挂在焦点元素的祖先（AXWebArea），
         //    所以只查焦点元素的话，Safari 里选中网页文字永远取不到 → 表现为"不生效"。
-        let found = readSelection(pid: pid, systemWide: systemWide)
+        let found = readSelection(pid: pid, systemWide: systemWide, bundleID: bid)
         debugLog("selFrom", found.source.rawValue)
+        if !found.text.isEmpty { missStreak = 0 }
         guard let elem = found.element, !found.text.isEmpty else {
             debugLog("selErr", found.errorCode)
             resetPending(); maybeHide(); return
@@ -894,8 +902,10 @@ final class SelectionPopupController {
             // （Chromium 里点别处常常仍返回旧选区值，所以这里的复位必须做）
             // 但鼠标还停在浮窗上时先别收起，免得用户正要点按钮时窗口消失
             resetPending()
-            suppressText = ""
-            suppressBundle = ""
+            // 只有**同一个 App** 里选区真的消失了，才清掉抑制。
+            // 否则会出现：在 A 里点掉浮窗 → 切到 B（B 里没选区）→ 顺手把 A 的抑制清掉
+            // → 切回 A 又弹（泽哥报的"不是每次都弹"就是这个）。
+            if bid == suppressBundle { suppressText = ""; suppressBundle = "" }
             lastText = ""
             if !mouseInside { hidePopup() }
             return
@@ -936,7 +946,7 @@ final class SelectionPopupController {
         enum Source: String { case systemFocus, appFocus, parent, descent, none }
     }
 
-    private func readSelection(pid: pid_t, systemWide: AXUIElement) -> Selection {
+    private func readSelection(pid: pid_t, systemWide: AXUIElement, bundleID: String) -> Selection {
         let systemFocused = focusedElement(of: systemWide)
         let appFocused = focusedElement(of: AXUIElementCreateApplication(pid))
 
@@ -966,6 +976,14 @@ final class SelectionPopupController {
         debugLog("focusRoles", "system=\(role(of: systemFocused)) app=\(role(of: appFocused))")
         if let e = systemFocused ?? appFocused {
             debugLog("rangeInfo", describeSelectionRange(of: e))
+        }
+        // 用户明明做了选区动作、却连续多次都找不到 → 说明这个 App 的读法我没吃准，
+        // 直接把它的无障碍树导出来（泽哥只需在 Safari 里选一次字，文件自动出现）
+        missStreak += 1
+        if missStreak >= 6, Date().timeIntervalSince(lastProbe) > 30,
+           Date().timeIntervalSince(lastGesture) < 3.0 {
+            lastProbe = Date()
+            dumpAXProbe(pid: pid, bundleID: bundleID, systemFocused: systemFocused, appFocused: appFocused)
         }
         return Selection(errorCode: "未找到选区")
     }
@@ -1000,6 +1018,81 @@ final class SelectionPopupController {
         return textForSelectedRange(of: e)
     }
 
+    /// 把一个 App 的无障碍树关键信息导出到 /tmp/yi-axprobe.txt。
+    /// 目的：遇到"读不到选区"的 App（如 Safari/WebKit）时，别靠猜 ——
+    /// 直接看它的焦点元素暴露了哪些属性、谁身上有选区，才能对着改。
+    private func dumpAXProbe(pid: pid_t, bundleID: String, systemFocused: AXUIElement?, appFocused: AXUIElement?) {
+        var out = "=== 「便捷翻译」选区诊断 ===\n"
+        out += "时间: \(Date())\n"
+        out += "前端 App: \(bundleID) (pid \(pid))\n"
+        out += "无障碍提示设置返回码: \(axHintResult)\n\n"
+
+        out += "[系统级焦点元素]\n" + describeElement(systemFocused)
+        out += "\n[应用级焦点元素]\n" + describeElement(appFocused)
+
+        out += "\n[父链（往上 8 层）]\n"
+        var cur: AXUIElement? = systemFocused ?? appFocused
+        for i in 1...8 {
+            guard let c = cur, let p = attribute(c, kAXParent) as! AXUIElement? else { break }
+            out += "  ↑\(i) \(briefElement(p))\n"
+            cur = p
+        }
+
+        out += "\n[子树扫描：谁身上有选区（限 250 节点 / 8 层 / 每节点最多 30 子）]\n"
+        var visited = 0
+        for root in [systemFocused, appFocused].compactMap({ $0 }) {
+            var queue: [(AXUIElement, Int)] = [(root, 0)]
+            while let (node, depth) = queue.first, visited < 250 {
+                queue.removeFirst(); visited += 1
+                out += "  \(briefElement(node))\n"
+                if depth < 8, let kids = attribute(node, kAXChildren) as? [AXUIElement] {
+                    queue.append(contentsOf: kids.prefix(30).map { ($0, depth + 1) })
+                }
+            }
+        }
+        out += "\n共访问 \(visited) 个节点\n"
+
+        try? out.write(toFile: "/tmp/yi-axprobe.txt", atomically: true, encoding: .utf8)
+        debugLog("probe", "已导出 /tmp/yi-axprobe.txt（\(visited) 节点）")
+    }
+
+    /// 详细描述：角色 + 暴露的全部属性名 + 选区的三种读法结果（诊断的核心信息）
+    private func describeElement(_ e: AXUIElement?) -> String {
+        guard let e else { return "  （拿不到）\n" }
+        var out = "  角色: \(role(of: e))\n"
+        var names: CFArray?
+        if AXUIElementCopyAttributeNames(e, &names) == .success, let list = names as? [String] {
+            out += "  属性(\(list.count)): \(list.joined(separator: ", "))\n"
+            out += "  含 AXSelectedText: \(list.contains("AXSelectedText"))"
+            out += " / AXSelectedTextRange: \(list.contains("AXSelectedTextRange"))"
+            out += " / AXStringForRange: \(list.contains("AXStringForRange"))\n"
+        } else {
+            out += "  属性: 读不到\n"
+        }
+        out += "  " + selectionProbe(of: e) + "\n"
+        return out
+    }
+
+    private func briefElement(_ e: AXUIElement) -> String {
+        "角色=\(role(of: e))  " + selectionProbe(of: e)
+    }
+
+    /// 三种读法各试一次，报结果（不返回文字，只报"有没有"）
+    private func selectionProbe(of e: AXUIElement) -> String {
+        var parts: [String] = []
+        if let t = attribute(e, kSelectedText) as? String {
+            parts.append("AXSelectedText(\(t.count)字)")
+        } else { parts.append("AXSelectedText=无") }
+
+        var rangeRef: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(e, kAXSelectedTextRange, &rangeRef)
+        if err == .success, let v = rangeRef as! AXValue? {
+            var r = CFRange(location: 0, length: 0)
+            parts.append(AXValueGetValue(v, .cfRange, &r) ? "Range(len=\(r.length))" : "Range(解析失败)")
+        } else { parts.append("Range(err=\(err.rawValue))") }
+        return parts.joined(separator: " ")
+    }
+
     /// 只读诊断：选区范围有没有、多长（不取字，避免污染日志）
     private func describeSelectionRange(of e: AXUIElement) -> String {
         var rangeRef: CFTypeRef?
@@ -1030,14 +1123,18 @@ final class SelectionPopupController {
     }
 
     private var lastDescent = Date.distantPast
-    private let descentInterval: TimeInterval = 0.8      // 兜底搜索最小间隔，防止每 0.2s 扫一次树
-    private let descentNodeBudget = 160                  // 单次最多访问多少个节点
+    private let descentInterval: TimeInterval = 1.0      // 兜底搜索最小间隔，防止每 0.2s 扫一次树
+    private let descentNodeBudget = 80                   // 单次最多访问多少个节点（AX 是跨进程 IPC，省着用）
+    private let descentGestureWindow: TimeInterval = 2.0 // 只在"刚有用户操作"这段时间内才值得扫树
 
     /// 在若干"根"的子树里找选区。**从焦点元素开始**很关键：
     /// 浏览器把焦点元素报成 AXWebArea（整页），选区就在它的子树里；
     /// 若从窗口开始扫，预算会先被工具栏/侧栏/标签栏吃掉，等不到内容区就用光了。
     private func descentSearch(roots: [AXUIElement]) -> (String, AXUIElement)? {
         let now = Date()
+        // 没人操作的时候扫树纯属浪费对方 App 的 CPU 和 IPC —— 这一步很贵，
+        // 而且会把我们自己的主线程占住（AX 调用是同步的），表现出来就是"浮窗时灵时不灵"。
+        guard now.timeIntervalSince(lastGesture) < descentGestureWindow else { return nil }
         guard now.timeIntervalSince(lastDescent) >= descentInterval else { return nil }
         lastDescent = now
 
@@ -1047,7 +1144,7 @@ final class SelectionPopupController {
             while let (node, depth) = queue.first, visited < descentNodeBudget {
                 queue.removeFirst()
                 visited += 1
-                if let t = selectedText(of: node) { return (t, node) }
+                if let t = selectedText(of: node, webKitRange: true) { return (t, node) }
                 if depth < descentMaxDepth, let kids = attribute(node, kAXChildren) as? [AXUIElement] {
                     queue.append(contentsOf: kids.prefix(20).map { ($0, depth + 1) })
                 }
