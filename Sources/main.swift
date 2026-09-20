@@ -789,6 +789,13 @@ final class SelectionPopupController {
     private let kTrustedPrompt = "AXTrustedCheckOptionPrompt" as CFString
     private let kAXPos = "AXPosition" as CFString
     private let kAXSz = "AXSize" as CFString
+    private let kAXParent = "AXParent" as CFString
+    private let kAXChildren = "AXChildren" as CFString
+    private let kAXRole = "AXRole" as CFString
+    private let kAXFocusedWindow = "AXFocusedWindow" as CFString
+    private let kAXEditableAncestor = "AXEditableAncestor" as CFString
+    private let kAXManualAccessibility = "AXManualAccessibility" as CFString      // Chromium 系认这个
+    private let kAXEnhancedUserInterface = "AXEnhancedUserInterface" as CFString  // WebKit/Safari 认这个
 
     var hasPermission: Bool { AXIsProcessTrusted() }
 
@@ -802,6 +809,7 @@ final class SelectionPopupController {
 
     func start() {
         stop()
+        installGestureMonitors()   // 记录"用户有没有主动操作"，用来挡住乱弹
         // 0.2s 轮询：配合 0.30s 的选区静止判定，"松手后约 0.4s 出浮窗"
         timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.poll() }
         RunLoop.main.add(timer!, forMode: .common)
@@ -809,6 +817,7 @@ final class SelectionPopupController {
 
     func stop() {
         timer?.invalidate(); timer = nil
+        removeGestureMonitors()
         hidePopup()
     }
 
@@ -830,31 +839,49 @@ final class SelectionPopupController {
         debugLog("trust", trusted ? "yes" : "no")
         guard trusted else { return }
 
-        // Electron/Chromium 应用（Discord、Chrome 等）默认不建无障碍树，
-        // 必须先设 AXManualAccessibility=true 才会暴露选区文本；每个进程打一次即可
+        // 浏览器默认**不构建完整无障碍树**（省性能），必须由辅助功能客户端先"打个招呼"，
+        // 它才会把网页内容（含选区）暴露出来。而且 Chromium 和 WebKit 认的属性名不一样：
+        //   · Chromium/Electron（Discord、Chrome、Edge）→ AXManualAccessibility
+        //   · WebKit（Safari）→ AXEnhancedUserInterface
+        // 两个都设（对方不认的属性会被忽略），每个进程一次即可。
+        // 之前只设了 Chromium 那个，所以 Discord 能用而 Safari 一直取不到选区。
         let pid = front.processIdentifier
         if !manualAccessPids.contains(pid) {
             let appElem = AXUIElementCreateApplication(pid)
-            AXUIElementSetAttributeValue(appElem, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            AXUIElementSetAttributeValue(appElem, kAXManualAccessibility, kCFBooleanTrue)
+            AXUIElementSetAttributeValue(appElem, kAXEnhancedUserInterface, kCFBooleanTrue)
             manualAccessPids.insert(pid)
         }
 
         let systemWide = AXUIElementCreateSystemWide()
-        var focusedRef: CFTypeRef?
-        let focusErr = AXUIElementCopyAttributeValue(systemWide, kFocusedUIElement, &focusedRef)
-        guard focusErr == .success, let focusedElem = focusedRef as! AXUIElement? else {
-            debugLog("focusedErr", "\(focusErr.rawValue)")
+
+        // ①【防乱弹】必须是"用户主动做的选区"才弹。
+        //    光看 AXSelectedText 非空是不够的：很多情况不是用户选的 —— 点地址栏时
+        //    系统自动全选、输入法组字时把候选标成选中、网页加载完自己设个选区……
+        //    这些都算"没人要求翻译"，弹出来就是骚扰。
+        if !userGestureRecently {
+            debugLog("noGesture", "跳过（非用户主动操作）")
             resetPending(); maybeHide(); return
         }
 
-        var selRef: CFTypeRef?
-        let selErr = AXUIElementCopyAttributeValue(focusedElem, kSelectedText, &selRef)
-        guard selErr == .success, let text = selRef as? String else {
-            debugLog("selErr", "\(selErr.rawValue)")
+        // ②【含 Safari】多来源找选区：不同 App 把 AXSelectedText 挂在不同层级上。
+        //    Chromium 挂在焦点元素上；WebKit/Safari 常挂在焦点元素的祖先（AXWebArea），
+        //    所以只查焦点元素的话，Safari 里选中网页文字永远取不到 → 表现为"不生效"。
+        let found = readSelection(pid: pid, systemWide: systemWide)
+        debugLog("selFrom", found.source.rawValue)
+        guard let elem = found.element, !found.text.isEmpty else {
+            debugLog("selErr", found.errorCode)
             resetPending(); maybeHide(); return
         }
 
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ③【防乱弹】选区落在可编辑控件里（地址栏、聊天输入框、搜索框）→ 不弹。
+        //    这些地方系统/输入法经常会"帮你选中"，而且用户在那里通常是要打字不是要翻译。
+        if isEditable(elem), !UserDefaults.standard.bool(forKey: "popupInEditable") {
+            debugLog("skipEditable", "跳过（选区在可编辑控件内）")
+            resetPending(); maybeHide(); return
+        }
+
+        let trimmed = found.text
         if trimmed.isEmpty {
             // 选区没了 → 清掉"已弹过 / 已被手动关掉"的记录，否则同一段文字以后再选就永远不弹了
             // （Chromium 里点别处常常仍返回旧选区值，所以这里的复位必须做）
@@ -871,7 +898,7 @@ final class SelectionPopupController {
             return
         }
 
-        // ① 防抖：拖选过程中选区一直在变，只有内容连续 settleDelay 秒没变（说明松手了）
+        // ④ 防抖：拖选过程中选区一直在变，只有内容连续 settleDelay 秒没变（说明松手了）
         //    才弹窗，避免"还没选完浮窗就跳出来"
         let now = Date()
         if trimmed != pendingText {
@@ -884,10 +911,149 @@ final class SelectionPopupController {
 
         debugLog("selected", "\(trimmed.count) 字符")
         lastText = trimmed
-        lastElement = focusedElem
-        // ② 锚点：优先用选区元素的屏幕矩形，拿不到（Electron 常给整页大矩形）退回鼠标位置
-        showPopup(text: trimmed, anchor: selectionAnchor(for: focusedElem))
+        lastElement = elem
+        // 锚点：优先用选区元素的屏幕矩形，拿不到（Electron 常给整页大矩形）退回鼠标位置
+        showPopup(text: trimmed, anchor: selectionAnchor(for: elem))
     }
+
+    // MARK: 选区读取（多来源回退）
+
+    private struct Selection {
+        var text: String = ""
+        var element: AXUIElement?
+        var source: Source = .none
+        var errorCode: String = ""
+        enum Source: String { case systemFocus, appFocus, parent, descent, none }
+    }
+
+    private func readSelection(pid: pid_t, systemWide: AXUIElement) -> Selection {
+        let systemFocused = focusedElement(of: systemWide)
+        let appFocused = focusedElement(of: AXUIElementCreateApplication(pid))
+
+        // 1) 焦点元素本身（Chromium、原生 App 走这条）
+        if let e = systemFocused, let t = selectedText(of: e) { return Selection(text: t, element: e, source: .systemFocus) }
+        // 2) App 级焦点元素：有些 App 只在 application 元素上填 AXFocusedUIElement
+        if let e = appFocused, let t = selectedText(of: e) { return Selection(text: t, element: e, source: .appFocus) }
+        // 3) 沿父链往上找（**Safari 走这条**：选区挂在 AXWebArea 上，而 WebArea 是焦点元素的祖先）
+        if let start = systemFocused ?? appFocused {
+            var cur: AXUIElement? = start
+            for _ in 0..<8 {
+                guard let c = cur, let p = attribute(c, kAXParent) as! AXUIElement? else { break }
+                if let t = selectedText(of: p) { return Selection(text: t, element: p, source: .parent) }
+                cur = p
+            }
+        }
+        // 4) 兜底：在焦点窗口里做"有预算的"广度搜索。
+        //    AX 调用是跨进程 IPC，不能随便全树扫，所以限制预算（节点数 + 间隔）。
+        if let hit = descentSearch(pid: pid) { return Selection(text: hit.0, element: hit.1, source: .descent) }
+        // 一个都没找到 → 把"焦点元素是什么角色"记下来，方便定位是哪类 App 不配合
+        debugLog("focusRoles", "system=\(role(of: systemFocused)) app=\(role(of: appFocused))")
+        return Selection(errorCode: "未找到选区")
+    }
+
+    private func role(of e: AXUIElement?) -> String {
+        guard let e, let r = attribute(e, kAXRole) as? String else { return "无" }
+        return r
+    }
+
+    private func focusedElement(of elem: AXUIElement) -> AXUIElement? {
+        attribute(elem, kFocusedUIElement) as! AXUIElement?
+    }
+
+    private func attribute(_ e: AXUIElement, _ name: CFString) -> CFTypeRef? {
+        var ref: CFTypeRef?
+        return AXUIElementCopyAttributeValue(e, name, &ref) == .success ? ref : nil
+    }
+
+    /// 该元素的选区文本；空串（真的没选东西）一律返回 nil，让调用方继续往上找
+    private func selectedText(of e: AXUIElement) -> String? {
+        guard let raw = attribute(e, kSelectedText) as? String else { return nil }
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    private var lastDescent = Date.distantPast
+    private let descentInterval: TimeInterval = 0.8      // 兜底搜索最小间隔，防止每 0.2s 扫一次树
+    private let descentNodeBudget = 160                  // 单次最多访问多少个节点
+
+    private func descentSearch(pid: pid_t) -> (String, AXUIElement)? {
+        let now = Date()
+        guard now.timeIntervalSince(lastDescent) >= descentInterval else { return nil }
+        lastDescent = now
+
+        let app = AXUIElementCreateApplication(pid)
+        guard let win = attribute(app, kAXFocusedWindow) as! AXUIElement? else { return nil }
+        var queue: [AXUIElement] = [win]
+        var visited = 0
+        while let node = queue.first, visited < descentNodeBudget {
+            queue.removeFirst()
+            visited += 1
+            if let t = selectedText(of: node) { return (t, node) }
+            if let kids = attribute(node, kAXChildren) as? [AXUIElement] {
+                queue.append(contentsOf: kids.prefix(24))     // 单个节点最多展开 24 个子节点
+            }
+        }
+        debugLog("descent", "扫了 \(visited) 个节点没找到选区")
+        return nil
+    }
+
+    // MARK: 用户主动操作检测
+
+    private var lastGesture = Date.distantPast
+    private var modifierHeld = false
+    private let gestureWindow: TimeInterval = 1.6
+    private var gestureMonitors: [Any] = []
+
+    /// "最近有用户主动操作"：鼠标按/松过，或者刚按过/正按着 Shift/⌘/⌥。
+    /// 后者是为了键盘选区（Shift+方向键、⌘A）：按住期间算，**松开那一刻也算一次**，
+    /// 否则松开 Shift 后闸门立刻关上，键盘选中的文字反而弹不出来。
+    private var userGestureRecently: Bool {
+        modifierHeld || Date().timeIntervalSince(lastGesture) < gestureWindow
+    }
+
+    /// 只监听"有没有操作"，不记录任何内容：
+    /// · 鼠标按下/松开 → 记时间戳
+    /// · 修饰键状态变化（flagsChanged）→ 记"是否按着修饰键"
+    /// 特意**不监听 keyDown**：那会把用户敲的每个字都过一遍我们的进程，
+    /// 既没必要（记 Shift 状态就够判断"是不是在键盘选字"）也不体面。
+    private func installGestureMonitors() {
+        guard gestureMonitors.isEmpty else { return }
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .flagsChanged]
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            guard let self else { return }
+            if event.type == .flagsChanged {
+                let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                let held = !mods.intersection([.shift, .command, .option, .control]).isEmpty
+                self.modifierHeld = held
+                self.lastGesture = Date()      // 按下和松开都算一次操作
+            } else {
+                self.lastGesture = Date()
+            }
+        }) {
+            gestureMonitors.append(m)
+        }
+    }
+
+    private func removeGestureMonitors() {
+        gestureMonitors.forEach { NSEvent.removeMonitor($0) }
+        gestureMonitors.removeAll()
+        modifierHeld = false
+    }
+
+    /// 选区所在元素是不是"可编辑控件"（地址栏/输入框/搜索框/聊天框）。
+    /// 看的是**提供选区的那个元素**，不是"当前焦点是谁" —— 这样不会误伤
+    /// "Discord 里选中一条消息"（那种情况选区在静态文本上，输入框只是碰巧还持有焦点）。
+    private func isEditable(_ e: AXUIElement) -> Bool {
+        if let role = attribute(e, kAXRole) as? String,
+           editableRoles.contains(role) { return true }
+        // Chromium 专用标记：元素自身不可编辑、但有可编辑祖先（网页表单里常见）
+        if attribute(e, kAXEditableAncestor) != nil { return true }
+        return false
+    }
+
+    private let editableRoles: Set<String> = [
+        "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField",
+    ]
 
     private func resetPending() { pendingText = ""; pendingSince = .distantPast }
 
@@ -2135,6 +2301,7 @@ struct EngineSettingsView: View {
     @AppStorage("edgeDock") private var edgeDock = true
     @AppStorage("accentTheme") private var accentTheme = "glass"
     @AppStorage("selectionPopup") private var selectionPopup = false
+    @AppStorage("popupInEditable") private var popupInEditable = false   // 输入框内也弹（默认关）
     @AppStorage("popupClearness") private var popupClearness = 0.5        // 选区浮窗
     @AppStorage("mainClearness") private var mainClearness = 0.30         // 翻译窗口
     @AppStorage("settingsClearness") private var settingsClearness = 0.30 // 设置窗口（就是本窗口）
@@ -2197,6 +2364,9 @@ struct EngineSettingsView: View {
                             SelectionPopupController.shared.stop()
                         }
                     }
+                Toggle("在输入框里也弹浮窗", isOn: $popupInEditable)
+                Text("默认关：地址栏、搜索框、聊天输入框经常被系统或输入法「自动选中」，在那里弹窗就是骚扰。需要就打开。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
                 if !SelectionPopupController.shared.hasPermission {
                     Button("打开「辅助功能」权限设置") {
                         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
