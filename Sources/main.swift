@@ -779,6 +779,7 @@ final class SelectionPopupController {
     private var pendingText = ""                    // 防抖：正在观察中的选区内容
     private var pendingSince = Date.distantPast
     private var suppressText = ""                   // 被用户手动关掉的选区内容（不再弹）
+    private var suppressBundle = ""                 // ↑ 这段文字是在哪个 App 里被关掉的
     private var lastFrontBundle = ""                // 用于判断"换了 App"
     private let settleDelay: TimeInterval = 0.30    // 选区内容静止多久才算"选完了"
     private let panelW: CGFloat = 320, panelH: CGFloat = 230
@@ -794,6 +795,8 @@ final class SelectionPopupController {
     private let kAXRole = "AXRole" as CFString
     private let kAXFocusedWindow = "AXFocusedWindow" as CFString
     private let kAXEditableAncestor = "AXEditableAncestor" as CFString
+    private let kAXSelectedTextRange = "AXSelectedTextRange" as CFString
+    private let kAXStringForRange = "AXStringForRange" as CFString               // 参数化属性
     private let kAXManualAccessibility = "AXManualAccessibility" as CFString      // Chromium 系认这个
     private let kAXEnhancedUserInterface = "AXEnhancedUserInterface" as CFString  // WebKit/Safari 认这个
 
@@ -833,8 +836,12 @@ final class SelectionPopupController {
         if front.bundleIdentifier == "com.zegeyoudaoli.translator" { hidePopup(); return }
         debugLog("front", front.bundleIdentifier ?? "?")
         // 换 App = 换了上下文：解除"这段文字被手动关过"的抑制，否则跨 App 会被一直拉黑
+        // 注意：这里**不能**在换 App 时清掉"已被手动关掉"的记录。
+        // 之前的写法就是这么干的，结果是：在 A 里点掉浮窗 → 切到 B → 切回 A，
+        // 选区还在、又弹一次 —— 用户视角就是"关不掉、一直弹"。
+        // 抑制按 (App, 文字) 绑定，换 App 各自保留；只有选区真的消失才清空。
         let bid = front.bundleIdentifier ?? "?"
-        if bid != lastFrontBundle { lastFrontBundle = bid; suppressText = "" }
+        lastFrontBundle = bid
         let trusted = AXIsProcessTrusted()
         debugLog("trust", trusted ? "yes" : "no")
         guard trusted else { return }
@@ -888,12 +895,15 @@ final class SelectionPopupController {
             // 但鼠标还停在浮窗上时先别收起，免得用户正要点按钮时窗口消失
             resetPending()
             suppressText = ""
+            suppressBundle = ""
             lastText = ""
             if !mouseInside { hidePopup() }
             return
         }
         if trimmed == lastText { return }       // 同一选区已经弹过了
-        if trimmed == suppressText {            // 用户手动关掉过这段 → 不再弹（哪怕它还选着）
+        // 用户手动关掉过这段 → 不再弹（哪怕它还选着）。
+        // 比对时连 App 一起看：在 Discord 关掉的文字，到别的 App 里选中照样该弹。
+        if trimmed == suppressText, bid == suppressBundle {
             debugLog("suppressed", "\(trimmed.count) 字符")
             return
         }
@@ -931,15 +941,15 @@ final class SelectionPopupController {
         let appFocused = focusedElement(of: AXUIElementCreateApplication(pid))
 
         // 1) 焦点元素本身（Chromium、原生 App 走这条）
-        if let e = systemFocused, let t = selectedText(of: e) { return Selection(text: t, element: e, source: .systemFocus) }
+        if let e = systemFocused, let t = selectedText(of: e, webKitRange: true) { return Selection(text: t, element: e, source: .systemFocus) }
         // 2) App 级焦点元素：有些 App 只在 application 元素上填 AXFocusedUIElement
-        if let e = appFocused, let t = selectedText(of: e) { return Selection(text: t, element: e, source: .appFocus) }
+        if let e = appFocused, let t = selectedText(of: e, webKitRange: true) { return Selection(text: t, element: e, source: .appFocus) }
         // 3) 沿父链往上找（**Safari 走这条**：选区挂在 AXWebArea 上，而 WebArea 是焦点元素的祖先）
         if let start = systemFocused ?? appFocused {
             var cur: AXUIElement? = start
             for _ in 0..<8 {
                 guard let c = cur, let p = attribute(c, kAXParent) as! AXUIElement? else { break }
-                if let t = selectedText(of: p) { return Selection(text: t, element: p, source: .parent) }
+                if let t = selectedText(of: p, webKitRange: true) { return Selection(text: t, element: p, source: .parent) }
                 cur = p
             }
         }
@@ -950,8 +960,13 @@ final class SelectionPopupController {
         if let e = appFocused { roots.append(e) }
         if let w = attribute(AXUIElementCreateApplication(pid), kAXFocusedWindow) as! AXUIElement? { roots.append(w) }
         if let hit = descentSearch(roots: roots) { return Selection(text: hit.0, element: hit.1, source: .descent) }
-        // 一个都没找到 → 把"焦点元素是什么角色"记下来，方便定位是哪类 App 不配合
+        // 一个都没找到 → 把诊断信息记下来，方便定位是哪类 App 不配合：
+        //   focusRoles = 焦点元素角色
+        //   rangeInfo  = 选区范围读不读得到、有多长（区分"树没建起来" vs "取字断掉"）
         debugLog("focusRoles", "system=\(role(of: systemFocused)) app=\(role(of: appFocused))")
+        if let e = systemFocused ?? appFocused {
+            debugLog("rangeInfo", describeSelectionRange(of: e))
+        }
         return Selection(errorCode: "未找到选区")
     }
 
@@ -969,10 +984,48 @@ final class SelectionPopupController {
         return AXUIElementCopyAttributeValue(e, name, &ref) == .success ? ref : nil
     }
 
-    /// 该元素的选区文本；空串（真的没选东西）一律返回 nil，让调用方继续往上找
-    private func selectedText(of e: AXUIElement) -> String? {
-        guard let raw = attribute(e, kSelectedText) as? String else { return nil }
-        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// 该元素的选区文本；没选到东西一律返回 nil，让调用方继续往上/往深找。
+    ///
+    /// 两条读法，缺一不可：
+    ///  ① 直接读 `AXSelectedText` —— Chromium/原生 App 走这条，一次调用就拿到
+    ///  ② **WebKit/Safari 这条属性是空的**（实测：整棵 AXWebArea 子树 160 个节点全没有），
+    ///     得先读 `AXSelectedTextRange` 拿到选区范围，再用参数化属性 `AXStringForRange`
+    ///     把那段文字取出来 —— VoiceOver 走的就是这条路。
+    private func selectedText(of e: AXUIElement, webKitRange: Bool = false) -> String? {
+        if let raw = attribute(e, kSelectedText) as? String {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { return t }
+        }
+        guard webKitRange else { return nil }
+        return textForSelectedRange(of: e)
+    }
+
+    /// 只读诊断：选区范围有没有、多长（不取字，避免污染日志）
+    private func describeSelectionRange(of e: AXUIElement) -> String {
+        var rangeRef: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(e, kAXSelectedTextRange, &rangeRef)
+        guard err == .success, let v = rangeRef as! AXValue? else { return "读不到(err=\(err.rawValue))" }
+        var range = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(v, .cfRange, &range) else { return "AXValue 解析失败" }
+        return "length=\(range.length)"
+    }
+
+    /// WebKit 专用：选区范围 → 参数化取字
+    private func textForSelectedRange(of e: AXUIElement) -> String? {
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(e, kAXSelectedTextRange, &rangeRef) == .success,
+              let v = rangeRef as! AXValue? else { return nil }
+        var range = CFRange(location: 0, length: 0)
+        guard AXValueGetValue(v, .cfRange, &range), range.length > 0 else { return nil }
+
+        var out: CFTypeRef?
+        let err = AXUIElementCopyParameterizedAttributeValue(e, kAXStringForRange, v, &out)
+        guard err == .success, let str = out as? String else {
+            // 有选区范围却取不出文字 → 记下来，方便定位是哪一步断的
+            debugLog("rangeFail", "err=\(err.rawValue)")
+            return nil
+        }
+        let t = str.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? nil : t
     }
 
@@ -1172,6 +1225,7 @@ final class SelectionPopupController {
     /// 哪怕它在原软件里还处于选中状态。等选区消失或换一段文字后才恢复。
     func dismissPopup() {
         suppressText = model.selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        suppressBundle = lastFrontBundle
         hidePopup()
     }
 }
