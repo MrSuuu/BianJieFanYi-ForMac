@@ -108,6 +108,18 @@ ditto -c -k --sequesterRsrc --keepParent "$APP_NAME" "../$ZIP"
 cd ..
 rm -rf "$DIST/$APP_NAME"
 
+# ---- 4. 复原本机开发用的【证书签名】app ----
+# ⚠️ 上面第 1 步用 SIGN_MODE=adhoc，会就地覆盖源树里的 $APP_NAME.app。
+#    若不还原，把源树 app 装进 /Applications 后就是「无证书签名」→ 与 TCC 里
+#    那条「certificate root = H"..."」的辅助功能授权失配 → 划词浮窗静默失灵。
+#    （2026-09-22 实测踩过，详见 .workbuddy/memory）
+echo "→ [复原] 重新用证书签名本机 app（避免 ad-hoc 覆盖导致 TCC 授权失配）"
+if bash build.sh >/dev/null 2>&1; then
+    echo "   ✅ 已恢复 \"Yi Dev Codesign\" 签名的本地 app"
+else
+    echo "   ⚠️ 复原失败：请手动跑 \`bash build.sh\` 重新用证书签名"
+fi
+
 echo
 echo "✓ 完成: $(pwd)/$ZIP  ($(du -h "$ZIP" | cut -f1))"
 echo "  内含: $APP_NAME.app（universal）+ 安装.command + 使用说明.txt"
