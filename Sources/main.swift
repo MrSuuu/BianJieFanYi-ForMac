@@ -775,7 +775,9 @@ final class SelectionPopupController {
     private var lastText: String = ""
     private var lastElement: AXUIElement?
     private var mouseInside = false
-    private var manualAccessPids: Set<Int32> = []   // 已打过无障碍提示的进程
+    private var manualAccessPids: Set<Int32> = []   // 已打过无障碍提示的进程（仅诊断展示）
+    private var lastWakeAt: [Int32: Date] = [:]     // 每个 pid 上次"唤醒"时间（节流，避免频繁重试卡主线程）
+    private var focusReadablePids: Set<Int32> = []  // 上一轮能拿到焦点元素的 pid（读不到就补唤醒）
     private var axHintResult = ""                   // 设置无障碍提示的返回码（诊断用）
     private var missStreak = 0                      // 连续"有选字动作但找不到选区"的次数
     private var probeAt: [String: Date] = [:]       // 诊断导出：每个 App 各自节流（别互相覆盖）
@@ -870,7 +872,18 @@ final class SelectionPopupController {
         // 两个都设（对方不认的属性会被忽略），每个进程一次即可。
         // 之前只设了 Chromium 那个，所以 Discord 能用而 Safari 一直取不到选区。
         let pid = front.processIdentifier
-        if !manualAccessPids.contains(pid) {
+        // ⚠️ 修 bug（v3.4 前）：以前这里是「每个 pid 只唤醒一次，而且不论成败都记进 manualAccessPids」，
+        //    于是踩两个坑，症状是"某个 App 用着用着就再也弹不出浮窗"：
+        //      ① 目标 App 正忙时 AXUIElementSetAttributeValue 会返回 -25204(CannotComplete)，
+        //         失败也被永久标记 → 之后再不复位、永远读不到（WorkBuddy/Xcode 的探针就是这个）；
+        //      ② Chromium/Electron（Discord/Chrome/Edge/WorkBuddy…）在闲置时会回收无障碍树，
+        //         只"打一次招呼"不够，树没了就再也读不到选区。
+        //    现在：只要上一轮拿不到焦点元素，就按 2s 节流补一次唤醒；能正常读到时完全不打扰。
+        //    节流是必须的 —— AX 调用是同步 IPC，对方卡住会阻塞本 App 主线程（超时已设 0.5s 兜底）。
+        let wakeNow = Date()
+        let canReadFocus = focusReadablePids.contains(pid)
+        let wakeTooSoon = wakeNow.timeIntervalSince(lastWakeAt[pid] ?? .distantPast) < 2.0
+        if !canReadFocus && !wakeTooSoon {
             let appElem = AXUIElementCreateApplication(pid)
             // 超时很关键：默认 AX 调用会等对方 App 响应，对方忙/卡时能拖住我们主线程好几秒，
             // 表现就是浮窗"时灵时不灵"甚至整个 app 卡住。0.5s 足够正常响应。
@@ -878,7 +891,14 @@ final class SelectionPopupController {
             let r1 = AXUIElementSetAttributeValue(appElem, kAXManualAccessibility, kCFBooleanTrue)
             let r2 = AXUIElementSetAttributeValue(appElem, kAXEnhancedUserInterface, kCFBooleanTrue)
             axHintResult = "Manual=\(r1.rawValue) Enhanced=\(r2.rawValue)"
-            manualAccessPids.insert(pid)
+            lastWakeAt[pid] = wakeNow
+            // 只有真成功、或该 App 明确不支持这两个属性（Safari 等）才算"搞定"；
+            // 瞬时失败（CannotComplete 等）不进集合 → 下次还会重试。
+            let settled = (r1 == .success || r2 == .success
+                           || r1 == .attributeUnsupported || r2 == .attributeUnsupported
+                           || r1 == .notImplemented || r2 == .notImplemented)
+            if settled { manualAccessPids.insert(pid) } else { manualAccessPids.remove(pid) }
+            debugLog("axWake", "\(axHintResult) \(settled ? "settled" : "retry")")
         }
 
         let systemWide = AXUIElementCreateSystemWide()
@@ -989,6 +1009,13 @@ final class SelectionPopupController {
     private func readSelection(pid: pid_t, systemWide: AXUIElement, bundleID: String) -> Selection {
         let systemFocused = focusedElement(of: systemWide)
         let appFocused = focusedElement(of: AXUIElementCreateApplication(pid))
+        // 记录"这轮能不能拿到焦点元素"：拿不到 = 目标 App 的无障碍树没建起来 / 被回收了
+        // → 下一轮 poll() 会补一次"唤醒"（见 poll() 里的 axWake 逻辑）。
+        if systemFocused != nil || appFocused != nil {
+            focusReadablePids.insert(pid)
+        } else {
+            focusReadablePids.remove(pid)
+        }
 
         // 1) 焦点元素本身（Chromium、原生 App 走这条）
         if let e = systemFocused, let t = selectedText(of: e, webKitRange: true) { return Selection(text: t, element: e, source: .systemFocus) }
